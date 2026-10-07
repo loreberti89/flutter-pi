@@ -771,6 +771,7 @@ static int on_set_playback_speed(char *channel, struct platch_obj *object, Flutt
 }
 
 static int on_play(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *responsehandle) {
+     LOG_ERROR("PLUGIN: on_play CALLED\n");
     struct gstplayer *player;
     struct std_value *arg;
     int ok;
@@ -1383,6 +1384,7 @@ static int on_set_playback_speed_v2(const struct raw_std_value *arg, FlutterPlat
 }
 
 static int on_play_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    LOG_ERROR("PLUGIN: on_play_v2 CALLED\n");
     struct gstplayer *player;
     int ok;
 
@@ -1455,8 +1457,13 @@ static int on_pause_v2(const struct raw_std_value *arg, FlutterPlatformMessageRe
     if (player == NULL) {
         return EINVAL;
     }
-
+    LOG_ERROR("PLUGIN: on_pause_v2 CALLED\n");
+if (gstplayer_is_live(player)) {
+    LOG_ERROR("PLUGIN: ignoring pause for live pipeline\n");
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
     ok = gstplayer_pause(player);
+    
     if (ok != 0) {
         return platch_respond_native_error_std(responsehandle, ok);
     }

@@ -60,6 +60,7 @@ struct buffering_state {
 
 struct video_info;
 struct gstplayer;
+bool gstplayer_is_live(struct gstplayer *player);
 struct flutterpi;
 
 /// Create a gstreamer video player that loads the video from a flutter asset.

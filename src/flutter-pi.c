@@ -159,8 +159,8 @@ EXAMPLES:\n\
   flutter-pi --videomode 1280x720@60 ./my_app\n\
 \n\
 SEE ALSO:\n\
-  Author:  Hannes Winkler, a.k.a ardera\n\
-  Source:  https://github.com/ardera/flutter-pi\n\
+  Author: FORKED BY  Hannes Winkler, a.k.a ardera\n\
+  Source:  https://github.com/loreberti89/flutter-pi\n\
   License: MIT\n\
 \n\
   For instructions on how to build an asset bundle or an AOT snapshot\n\

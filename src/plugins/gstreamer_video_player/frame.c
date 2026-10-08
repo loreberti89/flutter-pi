@@ -433,17 +433,17 @@ UNUSED int dup_gst_memory_as_dmabuf(struct gbm_device *gbm_device, GstMemory *me
     // because some drivers have limitations on the row length. (Intel)
     uint32_t dim = (uint32_t) ceil(sqrt(map_info.size));
 
-    LOG_ERROR(
+    /* LOG_ERROR(
     "GBM BO: map_size=%zu dim=%u device=%p\n",
     map_info.size,
     dim,
     (void *)gbm_device
-    );
+    ); */
     bo = gbm_bo_create(gbm_device, dim, dim, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
-    LOG_ERROR(
+    /* LOG_ERROR(
     "GBM BO result: bo=%p\n",
     (void *)bo
-    );
+    ); */
     if (bo == NULL) {
         LOG_ERROR("Couldn't create GBM BO to copy video frame into.\n");
         goto fail_unmap_buffer;

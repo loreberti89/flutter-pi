@@ -9,7 +9,7 @@
 
 #define _GNU_SOURCE
 #include "window.h"
-
+#include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
 
@@ -28,7 +28,7 @@
 #include "util/collection.h"
 #include "util/logging.h"
 #include "util/refcounting.h"
-
+#include <time.h>
 #include "config.h"
 
 #ifdef HAVE_EGL_GLES2
@@ -1104,14 +1104,27 @@ UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *u
 static void on_present_frame(void *userdata) {
     struct frame *frame;
     int ok;
+    struct timespec start, end;
+    double elapsed_ms;
 
     ASSERT_NOT_NULL(userdata);
-
     frame = userdata;
 
-    TRACER_BEGIN(frame->tracer, "kms_req_commit_nonblocking");
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    TRACER_BEGIN(frame->tracer, "kms_req_commit_blocking");
     ok = kms_req_commit_blocking(frame->req, NULL);
-    TRACER_END(frame->tracer, "kms_req_commit_nonblocking");
+    TRACER_END(frame->tracer, "kms_req_commit_blocking");
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    elapsed_ms =
+        (end.tv_sec - start.tv_sec) * 1000.0 +
+        (end.tv_nsec - start.tv_nsec) / 1000000.0;
+
+    if (elapsed_ms > 10.0) {
+       fprintf(stderr, "KMS commit: %.2f ms\n", elapsed_ms);
+    }
 
     if (ok != 0) {
         LOG_ERROR("Could not commit frame request.\n");

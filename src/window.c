@@ -1092,13 +1092,34 @@ struct frame {
     bool unset_should_apply_mode_on_commit;
 };
 
-UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *userdata) {
+/* UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *userdata) {
     ASSERT_NOT_NULL(drmdev);
     (void) drmdev;
     (void) vblank_ns;
     (void) userdata;
 
     /// TODO: What should we do here?
+} */
+
+static void frame_destroy(struct frame *frame) {
+    tracer_unref(frame->tracer);
+    kms_req_unref(frame->req);
+    free(frame);
+}
+static void on_scanout(
+    struct drmdev *drmdev,
+    uint64_t vblank_ns,
+    void *userdata
+) {
+    struct frame *frame;
+
+    ASSERT_NOT_NULL(drmdev);
+    ASSERT_NOT_NULL(userdata);
+
+    (void) vblank_ns;
+
+    frame = userdata;
+    frame_destroy(frame);
 }
 
 static void on_present_frame(void *userdata) {
@@ -1120,8 +1141,13 @@ static void on_present_frame(void *userdata) {
 
     previous = start;
 
-    ok = kms_req_commit_blocking(frame->req, NULL);
-
+    //ok = kms_req_commit_blocking(frame->req, NULL);
+    ok = kms_req_commit_nonblocking(
+        frame->req,
+        on_scanout,
+        frame,
+        NULL
+    );
     clock_gettime(CLOCK_MONOTONIC, &end);
     commit_ms = (end.tv_sec - start.tv_sec) * 1000.0
                 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
@@ -1130,16 +1156,20 @@ static void on_present_frame(void *userdata) {
         "PRESENT interval=%7.2f ms | KMS commit=%7.2f ms\n",
         interval_ms, commit_ms);
 
-    if (ok != 0) {
+    /* if (ok != 0) {
         LOG_ERROR("Could not commit frame request.\n");
     }
 
     tracer_unref(frame->tracer);
     kms_req_unref(frame->req);
-    free(frame);
+    free(frame); */
+    if (ok != 0) {
+        LOG_ERROR("Could not commit frame request.\n");
+        frame_destroy(frame);
+    }
 }
 
-static void on_cancel_frame(void *userdata) {
+/* static void on_cancel_frame(void *userdata) {
     struct frame *frame;
     ASSERT_NOT_NULL(userdata);
 
@@ -1148,6 +1178,10 @@ static void on_cancel_frame(void *userdata) {
     tracer_unref(frame->tracer);
     kms_req_unref(frame->req);
     free(frame);
+} */
+static void on_cancel_frame(void *userdata) {
+    ASSERT_NOT_NULL(userdata);
+    frame_destroy((struct frame *) userdata);
 }
 
 static int kms_window_push_composition_locked(struct window *window, struct fl_layer_composition *composition) {

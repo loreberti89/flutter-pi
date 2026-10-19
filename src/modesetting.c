@@ -3033,12 +3033,25 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
             kms_req_ref(req)
         );
     } else if (blocking) {
-        // handle the page-flip event here, rather than via the eventfd
-        ok = drmdev_on_modesetting_fd_ready_locked(builder->drmdev);
-        if (ok != 0) {
-            LOG_ERROR("Couldn't synchronously handle pageflip event.\n");
-            goto fail_unset_scanout_callback;
-        }
+          struct timespec t0, t1;
+          double wait_ms;
+
+          clock_gettime(CLOCK_MONOTONIC, &t0);
+
+          // Handle the page-flip event here, rather than via the eventfd.
+          ok = drmdev_on_modesetting_fd_ready_locked(builder->drmdev);
+
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+
+          wait_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+              + (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
+          fprintf(stderr, "PAGEFLIP wait = %.2f ms\n", wait_ms);
+
+          if (ok != 0) {
+              LOG_ERROR("Couldn't synchronously handle pageflip event.\n");
+              goto fail_unset_scanout_callback;
+          }
     }
 
     drmdev_unlock(builder->drmdev);

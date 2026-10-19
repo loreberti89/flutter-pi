@@ -2762,6 +2762,8 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
     bool internally_blocking;
     bool update_mode;
     int ok;
+    struct timespec commit_start, commit_end;
+    double drm_commit_ms;
 
     internally_blocking = false;
     update_mode = false;
@@ -2949,7 +2951,23 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
         /// TODO: If we're on raspberry pi and only have one layer, we can do an async pageflip
         /// on the primary plane to replace the next queued frame. (To do _real_ triple buffering
         /// with fully decoupled framerate, potentially)
-        ok = drmModeAtomicCommit(builder->drmdev->master_fd, builder->req, flags, kms_req_builder_ref(builder));
+        clock_gettime(CLOCK_MONOTONIC, &commit_start);
+
+        ok = drmModeAtomicCommit(
+            builder->drmdev->master_fd,
+            builder->req,
+            flags,
+            kms_req_builder_ref(builder)
+        );
+
+        clock_gettime(CLOCK_MONOTONIC, &commit_end);
+
+        drm_commit_ms =
+            (commit_end.tv_sec - commit_start.tv_sec) * 1000.0 +
+            (commit_end.tv_nsec - commit_start.tv_nsec) / 1000000.0;
+
+        fprintf(stderr, "DRM atomic syscall = %.2f ms\n", drm_commit_ms);
+
         if (ok != 0) {
             ok = errno;
             LOG_ERROR("Could not commit display update. drmModeAtomicCommit: %s\n", strerror(ok));

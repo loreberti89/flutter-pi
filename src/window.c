@@ -1104,27 +1104,31 @@ UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *u
 static void on_present_frame(void *userdata) {
     struct frame *frame;
     int ok;
+    static struct timespec previous = {0};
     struct timespec start, end;
-    double elapsed_ms;
+    double interval_ms, commit_ms;
 
     ASSERT_NOT_NULL(userdata);
     frame = userdata;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    TRACER_BEGIN(frame->tracer, "kms_req_commit_blocking");
+    interval_ms = previous.tv_sec == 0
+        ? 0.0
+        : (start.tv_sec - previous.tv_sec) * 1000.0
+          + (start.tv_nsec - previous.tv_nsec) / 1000000.0;
+
+    previous = start;
+
     ok = kms_req_commit_blocking(frame->req, NULL);
-    TRACER_END(frame->tracer, "kms_req_commit_blocking");
 
     clock_gettime(CLOCK_MONOTONIC, &end);
+    commit_ms = (end.tv_sec - start.tv_sec) * 1000.0
+                + (end.tv_nsec - start.tv_nsec) / 1000000.0;
 
-    elapsed_ms =
-        (end.tv_sec - start.tv_sec) * 1000.0 +
-        (end.tv_nsec - start.tv_nsec) / 1000000.0;
-
-    if (elapsed_ms > 10.0) {
-       fprintf(stderr, "KMS commit: %.2f ms\n", elapsed_ms);
-    }
+    fprintf(stderr,
+        "PRESENT interval=%7.2f ms | KMS commit=%7.2f ms\n",
+        interval_ms, commit_ms);
 
     if (ok != 0) {
         LOG_ERROR("Could not commit frame request.\n");

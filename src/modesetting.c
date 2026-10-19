@@ -2953,6 +2953,9 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
         /// with fully decoupled framerate, potentially)
         clock_gettime(CLOCK_MONOTONIC, &commit_start);
 
+fprintf(stderr,
+    "KMS flags: 0x%x | blocking=%d | update_mode=%d\n",
+    flags, blocking, update_mode);
         ok = drmModeAtomicCommit(
             builder->drmdev->master_fd,
             builder->req,

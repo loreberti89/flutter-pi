@@ -1106,25 +1106,20 @@ static void on_present_frame(void *userdata) {
     int ok;
     static struct timespec previous = {0};
     struct timespec start, end;
-    double interval_ms, commit_ms;
 
     ASSERT_NOT_NULL(userdata);
     frame = userdata;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    interval_ms = previous.tv_sec == 0
-        ? 0.0
-        : (start.tv_sec - previous.tv_sec) * 1000.0
-          + (start.tv_nsec - previous.tv_nsec) / 1000000.0;
+
 
     previous = start;
 
     ok = kms_req_commit_blocking(frame->req, NULL);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
-    commit_ms = (end.tv_sec - start.tv_sec) * 1000.0
-                + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+
 
 
 

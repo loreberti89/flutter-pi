@@ -2953,9 +2953,7 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
         /// with fully decoupled framerate, potentially)
         clock_gettime(CLOCK_MONOTONIC, &commit_start);
 
-/* fprintf(stderr,
-    "KMS flags: 0x%x | blocking=%d | update_mode=%d\n",
-    flags, blocking, update_mode); */
+        //fprintf(stderr,"KMS flags: 0x%x | blocking=%d | update_mode=%d\n",flags, blocking, update_mode);
         ok = drmModeAtomicCommit(
             builder->drmdev->master_fd,
             builder->req,
@@ -2969,7 +2967,7 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
             (commit_end.tv_sec - commit_start.tv_sec) * 1000.0 +
             (commit_end.tv_nsec - commit_start.tv_nsec) / 1000000.0;
 
-        fprintf(stderr, "DRM atomic syscall = %.2f ms\n", drm_commit_ms);
+        //fprintf(stderr, "DRM atomic syscall = %.2f ms\n", drm_commit_ms);
 
         if (ok != 0) {
             ok = errno;

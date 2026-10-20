@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -2762,8 +2762,6 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
     bool internally_blocking;
     bool update_mode;
     int ok;
-    struct timespec commit_start, commit_end;
-    double drm_commit_ms;
 
     internally_blocking = false;
     update_mode = false;
@@ -2951,24 +2949,7 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
         /// TODO: If we're on raspberry pi and only have one layer, we can do an async pageflip
         /// on the primary plane to replace the next queued frame. (To do _real_ triple buffering
         /// with fully decoupled framerate, potentially)
-        clock_gettime(CLOCK_MONOTONIC, &commit_start);
-
-        //fprintf(stderr,"KMS flags: 0x%x | blocking=%d | update_mode=%d\n",flags, blocking, update_mode);
-        ok = drmModeAtomicCommit(
-            builder->drmdev->master_fd,
-            builder->req,
-            flags,
-            kms_req_builder_ref(builder)
-        );
-
-        clock_gettime(CLOCK_MONOTONIC, &commit_end);
-
-        drm_commit_ms =
-            (commit_end.tv_sec - commit_start.tv_sec) * 1000.0 +
-            (commit_end.tv_nsec - commit_start.tv_nsec) / 1000000.0;
-
-        //fprintf(stderr, "DRM atomic syscall = %.2f ms\n", drm_commit_ms);
-
+        ok = drmModeAtomicCommit(builder->drmdev->master_fd, builder->req, flags, kms_req_builder_ref(builder));
         if (ok != 0) {
             ok = errno;
             LOG_ERROR("Could not commit display update. drmModeAtomicCommit: %s\n", strerror(ok));
@@ -3052,25 +3033,12 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
             kms_req_ref(req)
         );
     } else if (blocking) {
-          struct timespec t0, t1;
-          double wait_ms;
-
-          clock_gettime(CLOCK_MONOTONIC, &t0);
-
-          // Handle the page-flip event here, rather than via the eventfd.
-          ok = drmdev_on_modesetting_fd_ready_locked(builder->drmdev);
-
-          clock_gettime(CLOCK_MONOTONIC, &t1);
-
-          wait_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-              + (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
-
-          //fprintf(stderr, "PAGEFLIP wait = %.2f ms\n", wait_ms);
-
-          if (ok != 0) {
-              LOG_ERROR("Couldn't synchronously handle pageflip event.\n");
-              goto fail_unset_scanout_callback;
-          }
+        // handle the page-flip event here, rather than via the eventfd
+        ok = drmdev_on_modesetting_fd_ready_locked(builder->drmdev);
+        if (ok != 0) {
+            LOG_ERROR("Couldn't synchronously handle pageflip event.\n");
+            goto fail_unset_scanout_callback;
+        }
     }
 
     drmdev_unlock(builder->drmdev);

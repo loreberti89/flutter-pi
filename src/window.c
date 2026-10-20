@@ -1104,17 +1104,12 @@ UNUSED static void on_scanout(struct drmdev *drmdev, uint64_t vblank_ns, void *u
 static void on_present_frame(void *userdata) {
     struct frame *frame;
     int ok;
-    static struct timespec previous = {0};
     struct timespec start, end;
 
     ASSERT_NOT_NULL(userdata);
     frame = userdata;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
-
-
-
-    previous = start;
 
     ok = kms_req_commit_blocking(frame->req, NULL);
 

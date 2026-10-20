@@ -2953,9 +2953,9 @@ kms_req_commit_common(struct kms_req *req, bool blocking, kms_scanout_cb_t scano
         /// with fully decoupled framerate, potentially)
         clock_gettime(CLOCK_MONOTONIC, &commit_start);
 
-fprintf(stderr,
+/* fprintf(stderr,
     "KMS flags: 0x%x | blocking=%d | update_mode=%d\n",
-    flags, blocking, update_mode);
+    flags, blocking, update_mode); */
         ok = drmModeAtomicCommit(
             builder->drmdev->master_fd,
             builder->req,
@@ -3067,7 +3067,7 @@ fprintf(stderr,
           wait_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
               + (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
 
-          fprintf(stderr, "PAGEFLIP wait = %.2f ms\n", wait_ms);
+          //fprintf(stderr, "PAGEFLIP wait = %.2f ms\n", wait_ms);
 
           if (ok != 0) {
               LOG_ERROR("Couldn't synchronously handle pageflip event.\n");

@@ -1126,9 +1126,7 @@ static void on_present_frame(void *userdata) {
     commit_ms = (end.tv_sec - start.tv_sec) * 1000.0
                 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
 
-    fprintf(stderr,
-        "PRESENT interval=%7.2f ms | KMS commit=%7.2f ms\n",
-        interval_ms, commit_ms);
+
 
     if (ok != 0) {
         LOG_ERROR("Could not commit frame request.\n");

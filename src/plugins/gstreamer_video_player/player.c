@@ -930,14 +930,32 @@ static void on_deep_element_added(GstBin *bin, GstBin *sub_bin, GstElement *elem
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-sync")) {
             LOG_ERROR("NTP sync setting\n");
             gst_util_set_object_arg(G_OBJECT(element), "ntp-sync", "true");
+
+            gboolean ntp_sync_val;
+            g_object_get(G_OBJECT(element), "ntp-sync", &ntp_sync_val, NULL);
+            LOG_ERROR("VERIFICA -> ntp-sync è attualmente: %s\n", ntp_sync_val ? "TRUE" : "FALSE");
         }
+
+        // 2. NTP-TIME-SOURCE (Questo è un Enum, si legge come stringa)
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-time-source")) {
             LOG_ERROR("NTP time source setting\n");
             gst_util_set_object_arg(G_OBJECT(element), "ntp-time-source", "clock-time");
+
+            gchar *ntp_source_val = NULL;
+            g_object_get(G_OBJECT(element), "ntp-time-source", &ntp_source_val, NULL);
+            LOG_ERROR("VERIFICA -> ntp-time-source è attualmente: %s\n", ntp_source_val ? ntp_source_val : "NULL");
+            g_free(ntp_source_val); // Pulizia della memoria
         }
+
+        // 3. BUFFER-MODE (Anche questo è un Enum, si legge come stringa)
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "buffer-mode")) {
             LOG_ERROR("NTP buffer mode\n");
             gst_util_set_object_arg(G_OBJECT(element), "buffer-mode", "synced");
+
+            gchar *ntp_buffer_val = NULL;
+            g_object_get(G_OBJECT(element), "buffer-mode", &ntp_buffer_val, NULL);
+            LOG_ERROR("VERIFICA -> buffer-mode è attualmente: %s\n", ntp_buffer_val ? ntp_buffer_val : "NULL");
+            g_free(ntp_buffer_val); // Pulizia della memoria
         }
     }
 }

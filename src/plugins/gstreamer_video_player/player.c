@@ -942,6 +942,8 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
         LOG_ERROR("Could create GStreamer pipeline from description: %s (pipeline: `%s`)\n", error->message, pipeline_descr);
         return error->code;
     }
+    //AGGIUNTO PER TEST
+    g_signal_connect(pipeline, "deep-element-added", G_CALLBACK(on_deep_element_added), player);
 
     sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     LOG_ERROR("APPSINK ELEMENT: %p\n", (void *)sink);
@@ -1116,6 +1118,30 @@ fail_unref_pipeline:
 
     return ok;
 }
+
+/* AGGIUNTO PER TEST */
+static void on_deep_element_added(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer user_data) {
+    (void) bin;
+    (void) sub_bin;
+    (void) user_data;
+    GstElementFactory *factory = gst_element_get_factory(element);
+    if (!factory) return;
+    const gchar *factory_name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+    if (factory_name && strcmp(factory_name, "rtpbin") == 0) {
+        LOG_INFO("Configuring rtpbin for synchronized NTP playback\n");
+        // Verifica l'esistenza delle proprietà prima di settarle
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-sync")) {
+            gst_util_set_object_arg(G_OBJECT(element), "ntp-sync", "true");
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-time-source")) {
+            gst_util_set_object_arg(G_OBJECT(element), "ntp-time-source", "clock-time");
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "buffer-mode")) {
+            gst_util_set_object_arg(G_OBJECT(element), "buffer-mode", "synced");
+        }
+    }
+}
+
 
 static void maybe_deinit(struct gstplayer *player) {
     if (player->busfd_events != NULL) {

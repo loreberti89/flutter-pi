@@ -917,6 +917,29 @@ void on_source_setup(GstElement *bin, GstElement *source, gpointer userdata) {
     }
 }
 
+/* AGGIUNTO PER TEST */
+static void on_deep_element_added(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer user_data) {
+    (void) bin;
+    (void) sub_bin;
+    (void) user_data;
+    GstElementFactory *factory = gst_element_get_factory(element);
+    if (!factory) return;
+    const gchar *factory_name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+    if (factory_name && strcmp(factory_name, "rtpbin") == 0) {
+        LOG_ERROR("Configuring rtpbin for synchronized NTP playback\n");
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-sync")) {
+            gst_util_set_object_arg(G_OBJECT(element), "ntp-sync", "true");
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-time-source")) {
+            gst_util_set_object_arg(G_OBJECT(element), "ntp-time-source", "clock-time");
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "buffer-mode")) {
+            gst_util_set_object_arg(G_OBJECT(element), "buffer-mode", "synced");
+        }
+    }
+}
+
+
 static int init(struct gstplayer *player, bool force_sw_decoders) {
     GstStateChangeReturn state_change_return;
     sd_event_source *busfd_event_source;
@@ -1119,27 +1142,7 @@ fail_unref_pipeline:
     return ok;
 }
 
-/* AGGIUNTO PER TEST */
-static void on_deep_element_added(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer user_data) {
-    (void) bin;
-    (void) sub_bin;
-    (void) user_data;
-    GstElementFactory *factory = gst_element_get_factory(element);
-    if (!factory) return;
-    const gchar *factory_name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
-    if (factory_name && strcmp(factory_name, "rtpbin") == 0) {
-        LOG_ERROR("Configuring rtpbin for synchronized NTP playback\n");
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-sync")) {
-            gst_util_set_object_arg(G_OBJECT(element), "ntp-sync", "true");
-        }
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-time-source")) {
-            gst_util_set_object_arg(G_OBJECT(element), "ntp-time-source", "clock-time");
-        }
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "buffer-mode")) {
-            gst_util_set_object_arg(G_OBJECT(element), "buffer-mode", "synced");
-        }
-    }
-}
+
 
 
 static void maybe_deinit(struct gstplayer *player) {

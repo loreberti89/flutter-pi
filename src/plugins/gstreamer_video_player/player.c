@@ -928,12 +928,15 @@ static void on_deep_element_added(GstBin *bin, GstBin *sub_bin, GstElement *elem
     if (factory_name && strcmp(factory_name, "rtpbin") == 0) {
         LOG_ERROR("Configuring rtpbin for synchronized NTP playback\n");
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-sync")) {
+            LOG_ERROR("NTP sync setting\n");
             gst_util_set_object_arg(G_OBJECT(element), "ntp-sync", "true");
         }
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-time-source")) {
+            LOG_ERROR("NTP time source setting\n");
             gst_util_set_object_arg(G_OBJECT(element), "ntp-time-source", "clock-time");
         }
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "buffer-mode")) {
+            LOG_ERROR("NTP buffer mode\n");
             gst_util_set_object_arg(G_OBJECT(element), "buffer-mode", "synced");
         }
     }

@@ -1128,8 +1128,7 @@ static void on_deep_element_added(GstBin *bin, GstBin *sub_bin, GstElement *elem
     if (!factory) return;
     const gchar *factory_name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
     if (factory_name && strcmp(factory_name, "rtpbin") == 0) {
-        LOG_INFO("Configuring rtpbin for synchronized NTP playback\n");
-        // Verifica l'esistenza delle proprietà prima di settarle
+        LOG_ERROR("Configuring rtpbin for synchronized NTP playback\n");
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), "ntp-sync")) {
             gst_util_set_object_arg(G_OBJECT(element), "ntp-sync", "true");
         }

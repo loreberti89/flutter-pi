@@ -202,15 +202,16 @@ static int maybe_send_info(struct gstplayer *player) {
     player->info.has_seeking_info
 );	 */
 
-    if (player->info.has_resolution && player->info.has_fps && player->info.has_duration && player->info.has_seeking_info) {
+    if (!player->has_sent_info && player->info.has_resolution && player->info.has_fps && player->info.has_duration && player->info.has_seeking_info) {
         // we didn't send the info yet but we have complete video info now.
         // send it!
- LOG_ERROR("VIDEO INFO: sending initialized event\n"); 
-       duped = memdup(&(player->info.info), sizeof(player->info.info));
+        LOG_ERROR("VIDEO INFO: sending initialized event\n"); 
+        duped = memdup(&(player->info.info), sizeof(player->info.info));
         if (duped == NULL) {
             return ENOMEM;
         }
 
+        player->has_sent_info = true;
         notifier_notify(&player->video_info_notifier, duped);
     }
     return 0;
@@ -244,6 +245,7 @@ static void fetch_seeking(struct gstplayer *player) {
     seeking_query = gst_query_new_seeking(GST_FORMAT_TIME);
     ok = gst_element_query(player->pipeline, seeking_query);
     if (ok == FALSE) {
+        gst_query_unref(seeking_query);
         if (player->is_live) {
             player->info.info.can_seek = false;
             player->info.info.seek_begin_ms = 0;
@@ -669,8 +671,7 @@ static int on_bus_fd_ready(sd_event_source *s, int fd, uint32_t revents, void *u
 
     DEBUG_TRACE_BEGIN(player, "on_bus_fd_ready");
 
-    msg = gst_bus_pop(player->bus);
-    if (msg != NULL) {
+    while ((msg = gst_bus_pop(player->bus)) != NULL) {
         on_bus_message(player, msg);
         gst_message_unref(msg);
     }
@@ -968,7 +969,9 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     LOG_ERROR("PIPELINE CREATED: %p\n", (void *)pipeline);
     if (pipeline == NULL) {
         LOG_ERROR("Could create GStreamer pipeline from description: %s (pipeline: `%s`)\n", error->message, pipeline_descr);
-        return error->code;
+        int code = error->code;
+        g_clear_error(&error);
+        return code;
     }
     //AGGIUNTO PER TEST
     g_signal_connect(pipeline, "deep-element-added", G_CALLBACK(on_deep_element_added), player);
@@ -1154,6 +1157,12 @@ static void maybe_deinit(struct gstplayer *player) {
     if (player->busfd_events != NULL) {
         sd_event_source_unrefp(&player->busfd_events);
     }
+    if (player->pipeline != NULL) {
+        gst_element_set_state(GST_ELEMENT(player->pipeline), GST_STATE_READY);
+        gst_element_set_state(GST_ELEMENT(player->pipeline), GST_STATE_NULL);
+        gst_object_unref(GST_OBJECT(player->pipeline));
+        player->pipeline = NULL;
+    }
     if (player->sink != NULL) {
         gst_object_unref(GST_OBJECT(player->sink));
         player->sink = NULL;
@@ -1161,12 +1170,6 @@ static void maybe_deinit(struct gstplayer *player) {
     if (player->bus != NULL) {
         gst_object_unref(GST_OBJECT(player->bus));
         player->bus = NULL;
-    }
-    if (player->pipeline != NULL) {
-        gst_element_set_state(GST_ELEMENT(player->pipeline), GST_STATE_READY);
-        gst_element_set_state(GST_ELEMENT(player->pipeline), GST_STATE_NULL);
-        gst_object_unref(GST_OBJECT(player->pipeline));
-        player->pipeline = NULL;
     }
 }
 
@@ -1277,7 +1280,12 @@ fail_destroy_mutex:
 
 fail_free_gst_headers:
     gst_structure_free(gst_headers);
-    free(uri_owned);
+    if (uri_owned != NULL) {
+        free(uri_owned);
+    }
+    if (pipeline_descr_owned != NULL) {
+        free(pipeline_descr_owned);
+    }
 
 fail_destroy_frame_interface:
     frame_interface_unref(frame_interface);
@@ -1329,10 +1337,10 @@ struct gstplayer *gstplayer_new_from_pipeline(struct flutterpi *flutterpi, const
 
 void gstplayer_destroy(struct gstplayer *player) {
     LOG_DEBUG("gstplayer_destroy(%p)\n", player);
+    maybe_deinit(player);
     notifier_deinit(&player->video_info_notifier);
     notifier_deinit(&player->buffering_state_notifier);
     notifier_deinit(&player->error_notifier);
-    maybe_deinit(player);
     pthread_mutex_destroy(&player->lock);
     if (player->headers != NULL) {
         gst_structure_free(player->headers);
@@ -1354,6 +1362,7 @@ int64_t gstplayer_get_texture_id(struct gstplayer *player) {
 
 void gstplayer_put_http_header(struct gstplayer *player, const char *key, const char *value) {
     GValue gvalue = G_VALUE_INIT;
+    g_value_init(&gvalue, G_TYPE_STRING);
     g_value_set_string(&gvalue, value);
     gst_structure_take_value(player->headers, key, &gvalue);
 }

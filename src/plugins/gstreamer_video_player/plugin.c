@@ -205,7 +205,7 @@ get_player_from_map_arg(struct std_value *arg, struct gstplayer **player_out, Fl
 }
 
 static int ensure_initialized() {
-    GError *gst_error;
+    GError *gst_error = NULL;
     gboolean success;
 
     if (plugin.initialized) {
@@ -215,7 +215,9 @@ static int ensure_initialized() {
     success = gst_init_check(NULL, NULL, &gst_error);
     if (!success) {
         LOG_ERROR("Could not initialize gstreamer: %s\n", gst_error->message);
-        return gst_error->code;
+        int code = gst_error->code;
+        g_clear_error(&gst_error);
+        return code;
     }
 
     plugin.initialized = true;
@@ -850,6 +852,11 @@ static int on_pause(char *channel, struct platch_obj *object, FlutterPlatformMes
     if (ok != 0)
         return 0;
 
+    if (gstplayer_is_live(player)) {
+        LOG_ERROR("PLUGIN: ignoring pause for live pipeline\n");
+        return platch_respond_success_pigeon(responsehandle, NULL);
+    }
+
     gstplayer_pause(player);
     return platch_respond_success_pigeon(responsehandle, NULL);
 }
@@ -1055,7 +1062,7 @@ static int on_create_v2(const struct raw_std_value *arg, FlutterPlatformMessageR
     struct gstplayer_meta *meta;
     struct gstplayer *player;
     enum format_hint format_hint;
-    char *asset, *uri, *package_name, *pipeline;
+    char *asset = NULL, *uri = NULL, *package_name = NULL, *pipeline = NULL;
     size_t size;
     int ok;
 
@@ -1102,13 +1109,14 @@ static int on_create_v2(const struct raw_std_value *arg, FlutterPlatformMessageR
                 goto fail_respond_error;
             }
         } else {
+            free(asset);
             return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a String or null.");
         }
     } else {
         package_name = NULL;
     }
 
-    // arg[1]: URI
+    // arg[2]: URI
     if (size >= 3) {
         arg = raw_std_value_after(arg);
 
@@ -1121,6 +1129,8 @@ static int on_create_v2(const struct raw_std_value *arg, FlutterPlatformMessageR
                 goto fail_respond_error;
             }
         } else {
+            free(asset);
+            free(package_name);
             return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[2]` to be a String or null.");
         }
     } else {
@@ -1147,6 +1157,9 @@ static int on_create_v2(const struct raw_std_value *arg, FlutterPlatformMessageR
             }
         } else {
 invalid_format_hint:
+            free(asset);
+            free(package_name);
+            free(uri);
             return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[3]` to be one of 'ss', 'hls', 'dash', 'other' or null.");
         }
     } else {
@@ -1168,6 +1181,9 @@ invalid_format_hint:
             headers = arg;
         } else {
 invalid_headers:
+            free(asset);
+            free(package_name);
+            free(uri);
             return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[4]` to be a map of strings or null.");
         }
     } else {
@@ -1183,6 +1199,9 @@ invalid_headers:
         } else if (raw_std_value_is_string(arg)) {
             pipeline = raw_std_string_dup(arg);
         } else {
+            free(asset);
+            free(package_name);
+            free(uri);
             return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[5]` to be a string or null.");
         }
     } else {
@@ -1190,6 +1209,10 @@ invalid_headers:
     }
 
     if ((asset ? 1 : 0) + (uri ? 1 : 0) + (pipeline ? 1 : 0) != 1) {
+        free(asset);
+        free(package_name);
+        free(uri);
+        free(pipeline);
         return platch_respond_illegal_arg_std(responsehandle, "Expected exactly one of `arg[0]`, `arg[2]` or `arg[5]` to be non-null.");
     }
 
@@ -1215,6 +1238,11 @@ invalid_headers:
         pipeline = NULL;
     } else {
         UNREACHABLE();
+    }
+
+    if (package_name != NULL) {
+        free(package_name);
+        package_name = NULL;
     }
 
     if (player == NULL) {
@@ -1274,6 +1302,10 @@ fail_destroy_player:
     gstplayer_destroy(player);
 
 fail_respond_error:
+    free(asset);
+    free(package_name);
+    free(uri);
+    free(pipeline);
     return platch_respond_native_error_std(responsehandle, ok);
 }
 

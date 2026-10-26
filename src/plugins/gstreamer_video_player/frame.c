@@ -701,8 +701,8 @@ get_plane_infos(GstBuffer *buffer, const GstVideoInfo *info, struct gbm_device *
         continue;
 
 fail_close_fds:
-        for (int j = i - 1; j > 0; j--) {
-            close(plane_infos[i].fd);
+        for (int j = 0; j < i; j++) {
+            close(plane_infos[j].fd);
         }
         return ok;
     }
@@ -1136,7 +1136,7 @@ format_supported:
     return frame;
 
 fail_unbind_texture:
-    glBindTexture(texture, 0);
+    glBindTexture(target, 0);
 
 fail_delete_texture:
     glDeleteTextures(1, &texture);

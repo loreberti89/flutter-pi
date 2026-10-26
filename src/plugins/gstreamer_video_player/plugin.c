@@ -850,6 +850,11 @@ static int on_pause(char *channel, struct platch_obj *object, FlutterPlatformMes
     if (ok != 0)
         return 0;
 
+    if (gstplayer_is_live(player)) {
+        LOG_ERROR("PLUGIN: ignoring pause for live pipeline\n");
+        return platch_respond_success_pigeon(responsehandle, NULL);
+    }
+
     gstplayer_pause(player);
     return platch_respond_success_pigeon(responsehandle, NULL);
 }

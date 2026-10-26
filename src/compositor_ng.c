@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "compositor_ng.h"
 
+
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>

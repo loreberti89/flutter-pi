@@ -350,79 +350,108 @@ static int apply_playback_state(struct gstplayer *player) {
     }
 
     if (player->current_playback_rate != desired_rate || player->has_desired_position) {
-        if (player->has_desired_position) {
-            position = player->desired_position_ms * GST_MSECOND;
-        } else {
-            ok = gst_element_query_position(GST_ELEMENT(player->pipeline), GST_FORMAT_TIME, &position);
-            /* LOG_ERROR(
-              "PLAYBACK STATE: set_state(%s) returned %d\n",
-               gst_element_state_get_name(desired_state),
-               ok
-            ); */
-            if (ok == FALSE) {
-                LOG_ERROR("Could not get the current playback position to apply the playback speed.\n");
-                return EIO;
-            }
-        }
+        gboolean instant_rate_ok = FALSE;
 
-        if (player->direction == kForward) {
-            LOG_DEBUG(
-                "gst_element_seek(..., rate: %f, start: %" GST_TIME_FORMAT ", end: %" GST_TIME_FORMAT ", ...)\n",
-                desired_rate,
-                GST_TIME_ARGS(position),
-                GST_TIME_ARGS(GST_CLOCK_TIME_NONE)
-            );
+        // Try GST_SEEK_FLAG_INSTANT_RATE_CHANGE first if only playback speed is being changed (no seek position specified)
+        if (!player->has_desired_position && player->direction == kForward) {
+#ifndef GST_SEEK_FLAG_INSTANT_RATE_CHANGE
+#define GST_SEEK_FLAG_INSTANT_RATE_CHANGE (1 << 10)
+#endif
+            LOG_ERROR("GST: Requesting INSTANT_RATE_CHANGE to %f (seamless, no flush)\n", desired_rate);
             ok = gst_element_seek(
                 GST_ELEMENT(player->pipeline),
                 desired_rate,
                 GST_FORMAT_TIME,
-                GST_SEEK_FLAG_FLUSH |
-                    (player->do_fast_seeking ? GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SNAP_NEAREST : GST_SEEK_FLAG_ACCURATE),
-                GST_SEEK_TYPE_SET,
-                position,
-                GST_SEEK_TYPE_SET,
-                GST_CLOCK_TIME_NONE
-            );
-            if (ok == FALSE) {
-                LOG_ERROR(
-                    "Could not set the new playback speed / playback position (speed: %f, pos: %" GST_TIME_FORMAT ").\n",
-                    desired_rate,
-                    GST_TIME_ARGS(position)
-                );
-                return EIO;
-            }
-        } else {
-            LOG_DEBUG(
-                "gst_element_seek(..., rate: %f, start: %" GST_TIME_FORMAT ", end: %" GST_TIME_FORMAT ", ...)\n",
-                desired_rate,
-                GST_TIME_ARGS(0),
-                GST_TIME_ARGS(position)
-            );
-            ok = gst_element_seek(
-                GST_ELEMENT(player->pipeline),
-                desired_rate,
-                GST_FORMAT_TIME,
-                GST_SEEK_FLAG_FLUSH |
-                    (player->do_fast_seeking ? GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SNAP_NEAREST : GST_SEEK_FLAG_ACCURATE),
-                GST_SEEK_TYPE_SET,
+                GST_SEEK_FLAG_INSTANT_RATE_CHANGE,
+                GST_SEEK_TYPE_NONE,
                 0,
-                GST_SEEK_TYPE_SET,
-                position
+                GST_SEEK_TYPE_NONE,
+                0
             );
-
-            if (ok == FALSE) {
-                LOG_ERROR(
-                    "Could not set the new playback speed / playback position (speed: %f, pos: %" GST_TIME_FORMAT ").\n",
-                    desired_rate,
-                    GST_TIME_ARGS(position)
-                );
-                return EIO;
+            if (ok) {
+                LOG_ERROR("GST: INSTANT_RATE_CHANGE to %f succeeded seamlessly without pipeline flush!\n", desired_rate);
+                player->current_playback_rate = desired_rate;
+                instant_rate_ok = TRUE;
+            } else {
+                LOG_ERROR("GST: INSTANT_RATE_CHANGE refused by pipeline, falling back to flushing seek...\n");
             }
         }
 
-        player->current_playback_rate = desired_rate;
-        player->fallback_position_ms = GST_TIME_AS_MSECONDS(position);
-        player->has_desired_position = false;
+        if (!instant_rate_ok) {
+            if (player->has_desired_position) {
+                position = player->desired_position_ms * GST_MSECOND;
+            } else {
+                ok = gst_element_query_position(GST_ELEMENT(player->pipeline), GST_FORMAT_TIME, &position);
+                /* LOG_ERROR(
+                  "PLAYBACK STATE: set_state(%s) returned %d\n",
+                   gst_element_state_get_name(desired_state),
+                   ok
+                ); */
+                if (ok == FALSE) {
+                    LOG_ERROR("Could not get the current playback position to apply the playback speed.\n");
+                    return EIO;
+                }
+            }
+
+            if (player->direction == kForward) {
+                LOG_DEBUG(
+                    "gst_element_seek(..., rate: %f, start: %" GST_TIME_FORMAT ", end: %" GST_TIME_FORMAT ", ...)\n",
+                    desired_rate,
+                    GST_TIME_ARGS(position),
+                    GST_TIME_ARGS(GST_CLOCK_TIME_NONE)
+                );
+                ok = gst_element_seek(
+                    GST_ELEMENT(player->pipeline),
+                    desired_rate,
+                    GST_FORMAT_TIME,
+                    GST_SEEK_FLAG_FLUSH |
+                        (player->do_fast_seeking ? GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SNAP_NEAREST : GST_SEEK_FLAG_ACCURATE),
+                    GST_SEEK_TYPE_SET,
+                    position,
+                    GST_SEEK_TYPE_SET,
+                    GST_CLOCK_TIME_NONE
+                );
+                if (ok == FALSE) {
+                    LOG_ERROR(
+                        "Could not set the new playback speed / playback position (speed: %f, pos: %" GST_TIME_FORMAT ").\n",
+                        desired_rate,
+                        GST_TIME_ARGS(position)
+                    );
+                    return EIO;
+                }
+            } else {
+                LOG_DEBUG(
+                    "gst_element_seek(..., rate: %f, start: %" GST_TIME_FORMAT ", end: %" GST_TIME_FORMAT ", ...)\n",
+                    desired_rate,
+                    GST_TIME_ARGS(0),
+                    GST_TIME_ARGS(position)
+                );
+                ok = gst_element_seek(
+                    GST_ELEMENT(player->pipeline),
+                    desired_rate,
+                    GST_FORMAT_TIME,
+                    GST_SEEK_FLAG_FLUSH |
+                        (player->do_fast_seeking ? GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SNAP_NEAREST : GST_SEEK_FLAG_ACCURATE),
+                    GST_SEEK_TYPE_SET,
+                    0,
+                    GST_SEEK_TYPE_SET,
+                    position
+                );
+
+                if (ok == FALSE) {
+                    LOG_ERROR(
+                        "Could not set the new playback speed / playback position (speed: %f, pos: %" GST_TIME_FORMAT ").\n",
+                        desired_rate,
+                        GST_TIME_ARGS(position)
+                    );
+                    return EIO;
+                }
+            }
+
+            player->current_playback_rate = desired_rate;
+            player->fallback_position_ms = GST_TIME_AS_MSECONDS(position);
+            player->has_desired_position = false;
+        }
     }
 
     DEBUG_TRACE_BEGIN(player, "gst_element_get_state");

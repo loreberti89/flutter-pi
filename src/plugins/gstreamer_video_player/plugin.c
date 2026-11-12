@@ -20,6 +20,12 @@
 #include "util/list.h"
 #include "util/logging.h"
 
+#define GST_PLUG_LOG(fmt, ...) \
+    fprintf(stderr, "[GST-PLUGIN] " fmt "\n", ##__VA_ARGS__)
+
+#define GST_PLUG_ERR(fmt, ...) \
+    fprintf(stderr, "[GST-PLUGIN] [ERROR] " fmt "\n", ##__VA_ARGS__)
+
 enum data_source_type { kDataSourceTypeAsset, kDataSourceTypeNetwork, kDataSourceTypeFile, kDataSourceTypeContentUri };
 
 struct gstplayer_meta {
@@ -1258,8 +1264,12 @@ invalid_headers:
     // Finally, start initializing
     ok = gstplayer_initialize(player);
     if (ok != 0) {
+        GST_PLUG_ERR("on_create_v2: gstplayer_initialize failed (err=%d)", ok);
         goto fail_remove_receiver;
     }
+
+    GST_PLUG_LOG("on_create_v2: created player texture_id=%" PRId64 " (uri: %s, asset: %s)",
+        gstplayer_get_texture_id(player), uri ? uri : "null", asset ? asset : "null");
 
     return platch_respond_success_std(responsehandle, &STDINT64(gstplayer_get_texture_id(player)));
 
@@ -1285,6 +1295,7 @@ static int on_dispose_v2(const struct raw_std_value *arg, FlutterPlatformMessage
         return EINVAL;
     }
 
+    GST_PLUG_LOG("on_dispose_v2: disposing player texture_id=%" PRId64, gstplayer_get_texture_id(player));
     dispose_player(player, false, false);
 
     return platch_respond_success_std(responsehandle, &STDNULL);
@@ -1313,8 +1324,12 @@ static int on_set_looping_v2(const struct raw_std_value *arg, FlutterPlatformMes
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a bool.");
     }
 
+    GST_PLUG_LOG("on_set_looping_v2: texture_id=%" PRId64 ", looping=%s",
+        gstplayer_get_texture_id(player), looping ? "true" : "false");
+
     ok = gstplayer_set_looping(player, looping);
     if (ok != 0) {
+        GST_PLUG_ERR("on_set_looping_v2 FAILED for texture_id=%" PRId64, gstplayer_get_texture_id(player));
         return platch_respond_native_error_std(responsehandle, ok);
     }
 
@@ -1343,6 +1358,9 @@ static int on_set_volume_v2(const struct raw_std_value *arg, FlutterPlatformMess
     } else {
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a double.");
     }
+
+    GST_PLUG_LOG("on_set_volume_v2: texture_id=%" PRId64 ", volume=%f",
+        gstplayer_get_texture_id(player), volume);
 
     ok = gstplayer_set_volume(player, volume);
     if (ok != 0) {
@@ -1375,8 +1393,13 @@ static int on_set_playback_speed_v2(const struct raw_std_value *arg, FlutterPlat
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a double.");
     }
 
+    GST_PLUG_LOG("on_set_playback_speed_v2: texture_id=%" PRId64 ", speed=%.4f",
+        gstplayer_get_texture_id(player), speed);
+
     ok = gstplayer_set_playback_speed(player, speed);
     if (ok != 0) {
+        GST_PLUG_ERR("on_set_playback_speed_v2 FAILED for texture_id=%" PRId64 " (speed=%.4f)",
+            gstplayer_get_texture_id(player), speed);
         return platch_respond_native_error_std(responsehandle, ok);
     }
 
@@ -1384,7 +1407,6 @@ static int on_set_playback_speed_v2(const struct raw_std_value *arg, FlutterPlat
 }
 
 static int on_play_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
-    LOG_ERROR("PLUGIN: on_play_v2 CALLED\n");
     struct gstplayer *player;
     int ok;
 
@@ -1393,8 +1415,11 @@ static int on_play_v2(const struct raw_std_value *arg, FlutterPlatformMessageRes
         return EINVAL;
     }
 
+    GST_PLUG_LOG("on_play_v2: texture_id=%" PRId64, gstplayer_get_texture_id(player));
+
     ok = gstplayer_play(player);
     if (ok != 0) {
+        GST_PLUG_ERR("on_play_v2 FAILED for texture_id=%" PRId64, gstplayer_get_texture_id(player));
         return platch_respond_native_error_std(responsehandle, ok);
     }
 
@@ -1412,6 +1437,7 @@ static int on_get_position_v2(const struct raw_std_value *arg, FlutterPlatformMe
 
     position = gstplayer_get_position(player);
     if (position < 0) {
+        GST_PLUG_ERR("on_get_position_v2 FAILED for texture_id=%" PRId64, gstplayer_get_texture_id(player));
         return platch_respond_native_error_std(responsehandle, EIO);
     }
 
@@ -1441,8 +1467,13 @@ static int on_seek_to_v2(const struct raw_std_value *arg, FlutterPlatformMessage
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be an integer.");
     }
 
+    GST_PLUG_LOG("on_seek_to_v2: texture_id=%" PRId64 ", target position=%" PRId64 " ms",
+        gstplayer_get_texture_id(player), position);
+
     ok = gstplayer_seek_to(player, position, false);
     if (ok != 0) {
+        GST_PLUG_ERR("on_seek_to_v2 FAILED for texture_id=%" PRId64 " (pos=%" PRId64 " ms)",
+            gstplayer_get_texture_id(player), position);
         return platch_respond_native_error_std(responsehandle, ok);
     }
 
@@ -1457,14 +1488,19 @@ static int on_pause_v2(const struct raw_std_value *arg, FlutterPlatformMessageRe
     if (player == NULL) {
         return EINVAL;
     }
-    LOG_ERROR("PLUGIN: on_pause_v2 CALLED\n");
-if (gstplayer_is_live(player)) {
-    LOG_ERROR("PLUGIN: ignoring pause for live pipeline\n");
-    return platch_respond_success_std(responsehandle, &STDNULL);
-}
+
+    GST_PLUG_LOG("on_pause_v2: texture_id=%" PRId64 " (is_live=%d)",
+        gstplayer_get_texture_id(player), gstplayer_is_live(player));
+
+    if (gstplayer_is_live(player)) {
+        GST_PLUG_LOG("on_pause_v2: ignoring pause for live pipeline (texture_id=%" PRId64 ")",
+            gstplayer_get_texture_id(player));
+        return platch_respond_success_std(responsehandle, &STDNULL);
+    }
+
     ok = gstplayer_pause(player);
-    
     if (ok != 0) {
+        GST_PLUG_ERR("on_pause_v2 FAILED for texture_id=%" PRId64, gstplayer_get_texture_id(player));
         return platch_respond_native_error_std(responsehandle, ok);
     }
 

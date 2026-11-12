@@ -164,7 +164,8 @@ struct gstplayer {
      */
     int64_t desired_position_ms;
 
-    struct notifier video_info_notifier, buffering_state_notifier, error_notifier;
+    struct notifier video_info_notifier, buffering_state_notifier, error_notifier, eos_notifier;
+    bool is_eos;
 
     bool is_initialized;
     bool has_sent_info;
@@ -669,6 +670,11 @@ static void on_bus_message(struct gstplayer *player, GstMessage *msg) {
                 player->looping,
                 PLAYPAUSE_STATE_AS_STRING(player->playpause_state)
             );
+            if (!player->looping && !player->is_eos) {
+                player->is_eos = true;
+                GST_PLOG(player, "LOOP", "📢 Notifying EOS from GST_MESSAGE_EOS to Flutter");
+                notifier_notify(&player->eos_notifier, NULL);
+            }
             break;
 
         case GST_MESSAGE_CLOCK_LOST:
@@ -735,7 +741,12 @@ static void on_bus_message(struct gstplayer *player, GstMessage *msg) {
 
                     apply_playback_state(player);
                 } else {
-                    GST_PLOG(player, "LOOP", "ℹ️ 'appsink-eos' received but looping is FALSE -> end of video");
+                    GST_PLOG(player, "LOOP", "ℹ️ 'appsink-eos' received but looping is FALSE -> end of video, notifying EOS");
+                    if (!player->is_eos) {
+                        player->is_eos = true;
+                        GST_PLOG(player, "LOOP", "📢 Notifying EOS from appsink-eos to Flutter");
+                        notifier_notify(&player->eos_notifier, NULL);
+                    }
                 }
             } else {
                 const GstStructure *s = gst_message_get_structure(msg);
@@ -1296,6 +1307,10 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     if (ok != 0)
         goto fail_deinit_buffering_state_notifier;
 
+    ok = change_notifier_init(&player->eos_notifier);
+    if (ok != 0)
+        goto fail_deinit_error_notifier;
+
     player->flutterpi = flutterpi;
     player->userdata = userdata;
     player->video_uri = uri_owned;
@@ -1304,6 +1319,7 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->playback_rate_forward = 1.0;
     player->playback_rate_backward = 1.0;
     player->looping = false;
+    player->is_eos = false;
     player->playpause_state = kPaused;
     player->direction = kForward;
     player->current_playback_rate = 1.0;
@@ -1329,8 +1345,8 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->async_position_query_count = 0;
     return player;
 
-    //fail_deinit_error_notifier:
-    //notifier_deinit(&player->error_notifier);
+fail_deinit_error_notifier:
+    notifier_deinit(&player->error_notifier);
 
 fail_deinit_buffering_state_notifier:
     notifier_deinit(&player->buffering_state_notifier);
@@ -1398,6 +1414,7 @@ void gstplayer_destroy(struct gstplayer *player) {
     notifier_deinit(&player->video_info_notifier);
     notifier_deinit(&player->buffering_state_notifier);
     notifier_deinit(&player->error_notifier);
+    notifier_deinit(&player->eos_notifier);
     maybe_deinit(player);
     pthread_mutex_destroy(&player->lock);
     if (player->headers != NULL) {
@@ -1439,6 +1456,7 @@ int gstplayer_initialize(struct gstplayer *player) {
 int gstplayer_play(struct gstplayer *player) {
     GST_PLOG(player, "API", "gstplayer_play() called (is_live=%d, curr_state=%s)",
         player->is_live, PLAYPAUSE_STATE_AS_STRING(player->playpause_state));
+    player->is_eos = false;
     player->playpause_state = kPlaying;
     player->direction = kForward;
     return apply_playback_state(player);
@@ -1468,6 +1486,10 @@ int gstplayer_set_volume(struct gstplayer *player, double volume) {
 }
 
 int64_t gstplayer_get_position(struct gstplayer *player) {
+    if (player->is_eos && player->info.has_duration && player->info.info.duration_ms > 0) {
+        return player->info.info.duration_ms;
+    }
+
     GstState current, pending;
     gboolean ok;
     int64_t position;
@@ -1507,6 +1529,7 @@ int64_t gstplayer_get_position(struct gstplayer *player) {
 int gstplayer_seek_to(struct gstplayer *player, int64_t position, bool nearest_keyframe) {
     GST_PLOG(player, "API", "gstplayer_seek_to(%" PRId64 " ms, nearest_keyframe=%d) called",
         position, nearest_keyframe);
+    player->is_eos = false;
     player->has_desired_position = true;
     player->desired_position_ms = position;
     player->do_fast_seeking = nearest_keyframe;
@@ -1574,4 +1597,8 @@ struct notifier *gstplayer_get_buffering_state_notifier(struct gstplayer *player
 
 struct notifier *gstplayer_get_error_notifier(struct gstplayer *player) {
     return &player->error_notifier;
+}
+
+struct notifier *gstplayer_get_eos_notifier(struct gstplayer *player) {
+    return &player->eos_notifier;
 }

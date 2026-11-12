@@ -183,6 +183,11 @@ struct notifier *gstplayer_get_buffering_state_notifier(struct gstplayer *player
 /// Gets notified when an error happens. (Not yet implemented)
 struct notifier *gstplayer_get_error_notifier(struct gstplayer *player);
 
+/// @brief Get the change notifier for EOS (end of stream).
+///
+/// Gets notified when playback reaches the end of the video and looping is false.
+struct notifier *gstplayer_get_eos_notifier(struct gstplayer *player);
+
 struct video_frame;
 struct gl_renderer;
 

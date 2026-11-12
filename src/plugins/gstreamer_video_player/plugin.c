@@ -50,6 +50,7 @@ struct gstplayer_meta {
 
     struct listener *video_info_listener;
     struct listener *buffering_state_listener;
+    struct listener *eos_listener;
 };
 
 static struct plugin {
@@ -262,7 +263,7 @@ static int send_initialized_event(struct gstplayer_meta *meta, bool is_stream, i
     );
 }
 
-UNUSED static int send_completed_event(struct gstplayer_meta *meta) {
+static int send_completed_event(struct gstplayer_meta *meta) {
     return platch_send_success_event_std(meta->event_channel_name, &STDMAP1(STDSTRING("event"), STDSTRING("completed")));
 }
 
@@ -358,6 +359,20 @@ static enum listener_return on_buffering_state_notify(void *arg, void *userdata)
     return kNoAction;
 }
 
+static enum listener_return on_eos_notify(void *arg, void *userdata) {
+    struct gstplayer_meta *meta;
+    (void) arg;
+
+    ASSERT_NOT_NULL(userdata);
+    meta = userdata;
+
+    if (meta->has_listener) {
+        GST_PLUG_LOG("Sending completed event for texture_id=%" PRId64, gstplayer_get_texture_id(meta->player));
+        send_completed_event(meta);
+    }
+    return kNoAction;
+}
+
 /*******************************************************
  * CHANNEL HANDLERS                                    *
  * handle method calls on the method and event channel *
@@ -388,6 +403,12 @@ static int on_receive_evch(char *channel, struct platch_obj *object, FlutterPlat
         if (meta->buffering_state_listener == NULL) {
             LOG_ERROR("Couldn't listen for buffering events in gstplayer.\n");
         }
+
+        meta->eos_listener =
+            notifier_listen(gstplayer_get_eos_notifier(player), on_eos_notify, NULL, meta);
+        if (meta->eos_listener == NULL) {
+            LOG_ERROR("Couldn't listen for eos events in gstplayer.\n");
+        }
     } else if (streq("cancel", method)) {
         platch_respond_success_std(responsehandle, NULL);
         meta->has_listener = false;
@@ -399,6 +420,10 @@ static int on_receive_evch(char *channel, struct platch_obj *object, FlutterPlat
         if (meta->buffering_state_listener != NULL) {
             notifier_unlisten(gstplayer_get_buffering_state_notifier(player), meta->buffering_state_listener);
             meta->buffering_state_listener = NULL;
+        }
+        if (meta->eos_listener != NULL) {
+            notifier_unlisten(gstplayer_get_eos_notifier(player), meta->eos_listener);
+            meta->eos_listener = NULL;
         }
     } else {
         return platch_respond_not_implemented(responsehandle);
@@ -502,6 +527,9 @@ static struct gstplayer_meta *create_meta(int64_t texture_id, struct gstplayer *
     meta->event_channel_name = event_channel_name;
     meta->has_listener = false;
     meta->is_buffering = false;
+    meta->video_info_listener = NULL;
+    meta->buffering_state_listener = NULL;
+    meta->eos_listener = NULL;
     return meta;
 }
 
@@ -534,6 +562,10 @@ static void dispose_player(struct gstplayer *player, bool plugin_registry_locked
     if (meta->buffering_state_listener != NULL) {
         notifier_unlisten(gstplayer_get_buffering_state_notifier(player), meta->buffering_state_listener);
         meta->buffering_state_listener = NULL;
+    }
+    if (meta->eos_listener != NULL) {
+        notifier_unlisten(gstplayer_get_eos_notifier(player), meta->eos_listener);
+        meta->eos_listener = NULL;
     }
 
     destroy_meta(meta);

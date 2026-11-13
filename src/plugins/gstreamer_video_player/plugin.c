@@ -1356,9 +1356,6 @@ static int on_set_looping_v2(const struct raw_std_value *arg, FlutterPlatformMes
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a bool.");
     }
 
-    GST_PLUG_LOG("on_set_looping_v2: texture_id=%" PRId64 ", looping=%s",
-        gstplayer_get_texture_id(player), looping ? "true" : "false");
-
     ok = gstplayer_set_looping(player, looping);
     if (ok != 0) {
         GST_PLUG_ERR("on_set_looping_v2 FAILED for texture_id=%" PRId64, gstplayer_get_texture_id(player));
@@ -1391,9 +1388,6 @@ static int on_set_volume_v2(const struct raw_std_value *arg, FlutterPlatformMess
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a double.");
     }
 
-    GST_PLUG_LOG("on_set_volume_v2: texture_id=%" PRId64 ", volume=%f",
-        gstplayer_get_texture_id(player), volume);
-
     ok = gstplayer_set_volume(player, volume);
     if (ok != 0) {
         return platch_respond_native_error_std(responsehandle, ok);
@@ -1425,9 +1419,6 @@ static int on_set_playback_speed_v2(const struct raw_std_value *arg, FlutterPlat
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be a double.");
     }
 
-    GST_PLUG_LOG("on_set_playback_speed_v2: texture_id=%" PRId64 ", speed=%.4f",
-        gstplayer_get_texture_id(player), speed);
-
     ok = gstplayer_set_playback_speed(player, speed);
     if (ok != 0) {
         GST_PLUG_ERR("on_set_playback_speed_v2 FAILED for texture_id=%" PRId64 " (speed=%.4f)",
@@ -1446,8 +1437,6 @@ static int on_play_v2(const struct raw_std_value *arg, FlutterPlatformMessageRes
     if (player == NULL) {
         return EINVAL;
     }
-
-    GST_PLUG_LOG("on_play_v2: texture_id=%" PRId64, gstplayer_get_texture_id(player));
 
     ok = gstplayer_play(player);
     if (ok != 0) {
@@ -1499,9 +1488,6 @@ static int on_seek_to_v2(const struct raw_std_value *arg, FlutterPlatformMessage
         return platch_respond_illegal_arg_std(responsehandle, "Expected `arg[1]` to be an integer.");
     }
 
-    GST_PLUG_LOG("on_seek_to_v2: texture_id=%" PRId64 ", target position=%" PRId64 " ms",
-        gstplayer_get_texture_id(player), position);
-
     ok = gstplayer_seek_to(player, position, false);
     if (ok != 0) {
         GST_PLUG_ERR("on_seek_to_v2 FAILED for texture_id=%" PRId64 " (pos=%" PRId64 " ms)",
@@ -1521,12 +1507,7 @@ static int on_pause_v2(const struct raw_std_value *arg, FlutterPlatformMessageRe
         return EINVAL;
     }
 
-    GST_PLUG_LOG("on_pause_v2: texture_id=%" PRId64 " (is_live=%d)",
-        gstplayer_get_texture_id(player), gstplayer_is_live(player));
-
     if (gstplayer_is_live(player)) {
-        GST_PLUG_LOG("on_pause_v2: ignoring pause for live pipeline (texture_id=%" PRId64 ")",
-            gstplayer_get_texture_id(player));
         return platch_respond_success_std(responsehandle, &STDNULL);
     }
 

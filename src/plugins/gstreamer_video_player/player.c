@@ -51,9 +51,15 @@
         GST_ELEMENT_NAME(_element)                                                                                 \
     )
 
-#define GST_PLOG(player, tag, fmt, ...) \
-    fprintf(stderr, "[GST-PLAYER #%" PRId64 "] [" tag "] " fmt "\n", \
-        (player) ? (player)->texture_id : (int64_t)-1, ##__VA_ARGS__)
+#ifdef DEBUG
+    #define GST_PLOG(player, tag, fmt, ...) \
+        fprintf(stderr, "[GST-PLAYER #%" PRId64 "] [" tag "] " fmt "\n", \
+            (player) ? (player)->texture_id : (int64_t)-1, ##__VA_ARGS__)
+#else
+    #define GST_PLOG(player, tag, fmt, ...) \
+        do {                                \
+        } while (0)
+#endif
 
 #define GST_PLOG_ERR(player, tag, fmt, ...) \
     fprintf(stderr, "[GST-PLAYER #%" PRId64 "] [ERROR] [" tag "] " fmt "\n", \
@@ -63,7 +69,7 @@
     fprintf(stderr, "[GST-PLAYER #%" PRId64 "] [WARN] [" tag "] " fmt "\n", \
         (player) ? (player)->texture_id : (int64_t)-1, ##__VA_ARGS__)
 
-static const char *gst_state_change_return_name(GstStateChangeReturn ret) {
+UNUSED static const char *gst_state_change_return_name(GstStateChangeReturn ret) {
     switch (ret) {
         case GST_STATE_CHANGE_FAILURE: return "FAILURE";
         case GST_STATE_CHANGE_SUCCESS: return "SUCCESS";
@@ -978,12 +984,6 @@ static GstFlowReturn on_appsink_new_sample(GstAppSink *appsink, void *userdata) 
     }
 
     player->sample_count++;
-    if (player->sample_count == 1 || player->sample_count % 150 == 0) {
-        GstBuffer *buf = gst_sample_get_buffer(sample);
-        GstClockTime pts = buf ? GST_BUFFER_PTS(buf) : GST_CLOCK_TIME_NONE;
-        GST_PLOG(player, "APPSINK", "🎞️ Sample #%" PRIu64 " received (pts=%" GST_TIME_FORMAT " / %" PRId64 " ms)",
-            player->sample_count, GST_TIME_ARGS(pts), GST_CLOCK_TIME_IS_VALID(pts) ? GST_TIME_AS_MSECONDS(pts) : (int64_t)-1);
-    }
 
     frame = frame_new(player->frame_interface, sample, player->has_gst_info ? &player->gst_info : NULL);
 
@@ -1169,23 +1169,6 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     GST_PLOG(player, "INIT", "gst_element_set_state(PAUSED) returned %s (%d)",
         gst_state_change_return_name(state_change_return), state_change_return);
 
-    GstState current_state = GST_STATE_VOID_PENDING;
-    GstState pending_state = GST_STATE_VOID_PENDING;
-
-    GstStateChangeReturn get_state_result = gst_element_get_state(
-        GST_ELEMENT(pipeline),
-        &current_state,
-        &pending_state,
-        5 * GST_SECOND
-    );
-
-    GST_PLOG(player, "INIT", "Initial get_state: result=%s (%d), current=%s, pending=%s",
-        gst_state_change_return_name(get_state_result),
-        get_state_result,
-        gst_element_state_get_name(current_state),
-        gst_element_state_get_name(pending_state)
-    );
-
     if (state_change_return == GST_STATE_CHANGE_NO_PREROLL) {
         GST_PLOG(player, "INIT", "Pipeline is LIVE stream (NO_PREROLL)");
         player->is_live = true;
@@ -1197,12 +1180,7 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
 
     if (player->is_live) {
         GST_PLOG(player, "INIT", "Live pipeline -> auto-transitioning to PLAYING...");
-        GstStateChangeReturn play_result = gst_element_set_state(
-            GST_ELEMENT(pipeline),
-            GST_STATE_PLAYING
-        );
-        GST_PLOG(player, "INIT", "Live PLAYING result=%s (%d)",
-            gst_state_change_return_name(play_result), play_result);
+        gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PLAYING);
     }
 
     player->sink = sink;

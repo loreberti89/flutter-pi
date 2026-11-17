@@ -165,6 +165,32 @@ int gstplayer_step_forward(struct gstplayer *player);
 
 int gstplayer_step_backward(struct gstplayer *player);
 
+struct _GstClock;
+
+/// Set the clock the pipeline should use (e.g. a shared GstNetClientClock), plus an optional fixed pipeline latency.
+///     @arg clock      The clock to use. The player takes its own reference. NULL restores automatic clock selection.
+///     @arg latency_ns Fixed pipeline latency in nanoseconds, or -1 (GST_CLOCK_TIME_NONE) for the automatically
+///                     computed latency. Use the same value on every node that should play in sync.
+///
+/// Can be called before or after @ref gstplayer_initialize. A pipeline that is already PLAYING keeps
+/// running on its previous clock until its next PAUSED -> PLAYING transition (e.g. the next @ref gstplayer_play_at).
+/// Must be called on the flutter-pi platform thread.
+void gstplayer_set_sync_clock(struct gstplayer *player, struct _GstClock *clock, int64_t latency_ns);
+
+/// Start playback so that running-time 0 of the current segment is rendered when the pipeline clock reads
+/// @arg base_time_ns. Used to align multiple pipelines sharing the same (network) clock.
+///     @arg base_time_ns  Absolute pipeline-clock time in nanoseconds (same time domain as @ref gstplayer_set_sync_clock).
+///     @arg position_ms   Position to (accurately) seek to before starting, or -1 to keep the current position.
+///                        After the (flushing) seek the running-time restarts at 0, so the frame at @arg position_ms
+///                        is rendered at @arg base_time_ns. With -1 the frame currently due is the one at the current
+///                        running-time, which is only deterministic across nodes if they all prerolled without playing.
+///
+/// Puts the player in "synchronized mode": the base time is kept fixed across pause/seek, and native looping
+/// shifts the base time by the segment duration, so that all nodes loop at the same instant.
+/// A plain @ref gstplayer_play on a paused player leaves synchronized mode.
+///     @returns 0 on success, errno-style error code if an error ocurred.
+int gstplayer_play_at(struct gstplayer *player, int64_t base_time_ns, int64_t position_ms);
+
 /// @brief Get the value notifier for the video info.
 ///
 /// Gets notified with a value of type `struct video_info*` when the video info changes.

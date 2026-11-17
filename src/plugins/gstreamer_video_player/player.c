@@ -193,6 +193,34 @@ struct gstplayer {
 
     uint64_t sample_count;
     int async_position_query_count;
+
+    /**
+     * @brief Clock the pipeline should use (e.g. a shared GstNetClientClock), or NULL for automatic clock selection.
+     * Owned reference. Only accessed on the platform thread.
+     */
+    GstClock *sync_clock;
+
+    /**
+     * @brief Fixed pipeline latency to use, or GST_CLOCK_TIME_NONE for the automatically computed one.
+     */
+    GstClockTime sync_latency;
+
+    /**
+     * @brief True if playback was started with @ref gstplayer_play_at, i.e. base_time is shared with other nodes
+     * and the pipeline start_time is GST_CLOCK_TIME_NONE (base_time is never recomputed by the pipeline).
+     */
+    bool sync_mode;
+
+    /**
+     * @brief The base time currently applied in sync mode (pipeline clock domain).
+     */
+    GstClockTime sync_base_time;
+
+    /**
+     * @brief True if apply_playback_state should (re)start the pipeline with @ref desired_base_time.
+     */
+    bool has_desired_base_time;
+    GstClockTime desired_base_time;
 };
 
 bool gstplayer_is_live(struct gstplayer *player) {
@@ -361,6 +389,61 @@ static int init(struct gstplayer *player, bool force_sw_decoders);
 
 static void maybe_deinit(struct gstplayer *player);
 
+/**
+ * @brief (Re)start the pipeline in PLAYING with the shared base time in @ref gstplayer::desired_base_time.
+ *
+ * The pipeline only distributes base_time (and selects its clock) on the PAUSED -> PLAYING transition, so if the
+ * pipeline is (going to) PLAYING we first request PAUSED. start_time is set to GST_CLOCK_TIME_NONE so GstPipeline
+ * never recomputes base_time (neither on PAUSED -> PLAYING nor after flushing seeks).
+ * Never blocks: all state changes may complete asynchronously.
+ */
+static int apply_shared_base_time(struct gstplayer *player, GstState current_state, GstState pending_state) {
+    GstStateChangeReturn ret;
+    GstClock *clock;
+
+    if (current_state == GST_STATE_PLAYING || pending_state == GST_STATE_PLAYING) {
+        ret = gst_element_set_state(player->pipeline, GST_STATE_PAUSED);
+        GST_PLOG(player, "SYNC", "Re-arming base time: gst_element_set_state(PAUSED) returned %s", gst_state_change_return_name(ret));
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            GST_PLOG_ERR(player, "SYNC", "Setting pipeline to PAUSED before applying base time failed!");
+            return EIO;
+        }
+    }
+
+    gst_element_set_start_time(player->pipeline, GST_CLOCK_TIME_NONE);
+    gst_element_set_base_time(player->pipeline, player->desired_base_time);
+
+    clock = gst_pipeline_get_pipeline_clock(GST_PIPELINE(player->pipeline));
+    if (clock != NULL) {
+        GstClockTime now = gst_clock_get_time(clock);
+        GstClockTimeDiff until_start = GST_CLOCK_DIFF(now, player->desired_base_time);
+
+        if (until_start < 0) {
+            GST_PLOG_WARN(player, "SYNC", "Base time %" GST_TIME_FORMAT " is %" PRId64 " ms in the past (clock %s, synced=%d): "
+                "first frames will be late/dropped",
+                GST_TIME_ARGS(player->desired_base_time), (int64_t) GST_TIME_AS_MSECONDS(-until_start), GST_OBJECT_NAME(clock),
+                gst_clock_is_synced(clock));
+        } else {
+            GST_PLOG(player, "SYNC", "Base time %" GST_TIME_FORMAT " -> playback starts in %" PRId64 " ms (clock %s, synced=%d)",
+                GST_TIME_ARGS(player->desired_base_time), (int64_t) GST_TIME_AS_MSECONDS(until_start), GST_OBJECT_NAME(clock),
+                gst_clock_is_synced(clock));
+        }
+        gst_object_unref(clock);
+    }
+
+    ret = gst_element_set_state(player->pipeline, GST_STATE_PLAYING);
+    GST_PLOG(player, "SYNC", "gst_element_set_state(PLAYING) with shared base time returned %s", gst_state_change_return_name(ret));
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        GST_PLOG_ERR(player, "SYNC", "Setting pipeline to PLAYING with shared base time failed!");
+        return EIO;
+    }
+
+    player->sync_mode = true;
+    player->sync_base_time = player->desired_base_time;
+    player->has_desired_base_time = false;
+    return 0;
+}
+
 static int apply_playback_state(struct gstplayer *player) {
     GstStateChangeReturn ok;
     GstState desired_state, current_state = GST_STATE_VOID_PENDING, pending_state = GST_STATE_VOID_PENDING;
@@ -499,6 +582,12 @@ static int apply_playback_state(struct gstplayer *player) {
         return EIO;
     }
 
+    if (player->has_desired_base_time && desired_state == GST_STATE_PLAYING) {
+        int sync_ok = apply_shared_base_time(player, current_state, pending_state);
+        DEBUG_TRACE_END(player, "apply_playback_state");
+        return sync_ok;
+    }
+
     if (pending_state == GST_STATE_VOID_PENDING) {
         if (current_state == desired_state) {
             // we're already in the desired state, and we're also not changing it
@@ -542,6 +631,52 @@ static int apply_playback_state(struct gstplayer *player) {
 
     DEBUG_TRACE_END(player, "apply_playback_state");
     return 0;
+}
+
+/**
+ * @brief Get the running-time at which the last rendered buffer ends (i.e. the running-time of EOS).
+ *
+ * Uses the appsink "last-sample" (enabled by default on basesink), so it is exact and independent of the position
+ * the current segment started at. Must be called before the next flushing seek (which clears the last sample).
+ */
+static bool get_last_buffer_end_running_time(struct gstplayer *player, GstClockTime *running_time_out) {
+    const GstSegment *segment;
+    GstClockTime end, running_time;
+    GstSample *sample;
+    GstBuffer *buffer;
+    bool ok = false;
+
+    sample = gst_base_sink_get_last_sample(GST_BASE_SINK(player->sink));
+    if (sample == NULL) {
+        return false;
+    }
+
+    buffer = gst_sample_get_buffer(sample);
+    segment = gst_sample_get_segment(sample);
+    if (buffer == NULL || segment == NULL || segment->format != GST_FORMAT_TIME || !GST_BUFFER_PTS_IS_VALID(buffer)) {
+        goto out_unref_sample;
+    }
+
+    end = GST_BUFFER_PTS(buffer);
+    if (GST_BUFFER_DURATION_IS_VALID(buffer)) {
+        end += GST_BUFFER_DURATION(buffer);
+    } else if (player->has_gst_info && GST_VIDEO_INFO_FPS_N(&player->gst_info) > 0) {
+        end += gst_util_uint64_scale_int(GST_SECOND, GST_VIDEO_INFO_FPS_D(&player->gst_info), GST_VIDEO_INFO_FPS_N(&player->gst_info));
+    }
+
+    if (GST_CLOCK_TIME_IS_VALID(segment->stop) && end > segment->stop) {
+        end = segment->stop;
+    }
+
+    running_time = gst_segment_to_running_time(segment, GST_FORMAT_TIME, end);
+    if (GST_CLOCK_TIME_IS_VALID(running_time)) {
+        *running_time_out = running_time;
+        ok = true;
+    }
+
+out_unref_sample:
+    gst_sample_unref(sample);
+    return ok;
 }
 
 static void on_bus_message(struct gstplayer *player, GstMessage *msg) {
@@ -725,6 +860,25 @@ static void on_bus_message(struct gstplayer *player, GstMessage *msg) {
                         "🔄 Looping active: seeking back to 0 (FLUSH | ACCURATE, rate=%.4f)...",
                         player->current_playback_rate
                     );
+
+                    if (player->sync_mode && player->playpause_state == kPlaying && player->direction == kForward) {
+                        // The flushing seek below restarts running-time at 0 while start_time is NONE (base_time is
+                        // kept), so without a shift the new loop would be "late" by the whole duration. Shift base_time
+                        // by the running-time of EOS: every node with the same content computes the same value, so all
+                        // loops restart at the same clock time without any network round trip.
+                        GstClockTime eos_running_time;
+                        if (get_last_buffer_end_running_time(player, &eos_running_time)) {
+                            player->desired_base_time = player->sync_base_time + eos_running_time;
+                            player->has_desired_base_time = true;
+                            GST_PLOG(player, "SYNC", "Sync loop: EOS running-time=%" GST_TIME_FORMAT ", base time %" GST_TIME_FORMAT
+                                " -> %" GST_TIME_FORMAT,
+                                GST_TIME_ARGS(eos_running_time), GST_TIME_ARGS(player->sync_base_time),
+                                GST_TIME_ARGS(player->desired_base_time));
+                        } else {
+                            GST_PLOG_WARN(player, "SYNC", "Sync loop: could not determine EOS running-time, base time not shifted "
+                                "(frames will be late until resynced with playAt)");
+                        }
+                    }
 
                     DEBUG_TRACE_BEGIN(player, "gst_element_seek");
                     gboolean loop_seek_ok = gst_element_seek(
@@ -1087,6 +1241,23 @@ static int init(struct gstplayer *player, bool force_sw_decoders) {
     //AGGIUNTO PER TEST
     g_signal_connect(pipeline, "deep-element-added", G_CALLBACK(on_deep_element_added), player);
 
+    if (!GST_IS_PIPELINE(pipeline)) {
+        GST_PLOG_ERR(player, "INIT", "Parsed pipeline description is not a GstPipeline (pipeline: `%s`)", pipeline_descr);
+        ok = EINVAL;
+        goto fail_unref_pipeline;
+    }
+
+    // Must happen before the first PAUSED -> PLAYING transition, that's when the pipeline selects its clock.
+    if (player->sync_clock != NULL) {
+        gst_pipeline_use_clock(GST_PIPELINE(pipeline), player->sync_clock);
+        GST_PLOG(player, "SYNC", "Pipeline will use clock %s (synced=%d)", GST_OBJECT_NAME(player->sync_clock),
+            gst_clock_is_synced(player->sync_clock));
+    }
+    if (GST_CLOCK_TIME_IS_VALID(player->sync_latency)) {
+        gst_pipeline_set_latency(GST_PIPELINE(pipeline), player->sync_latency);
+        GST_PLOG(player, "SYNC", "Pipeline fixed latency: %" GST_TIME_FORMAT, GST_TIME_ARGS(player->sync_latency));
+    }
+
     sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     if (sink == NULL) {
         GST_PLOG_ERR(player, "INIT", "Couldn't find appsink 'sink' in pipeline bin!");
@@ -1321,6 +1492,12 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     player->is_live = false;
     player->sample_count = 0;
     player->async_position_query_count = 0;
+    player->sync_clock = NULL;
+    player->sync_latency = GST_CLOCK_TIME_NONE;
+    player->sync_mode = false;
+    player->sync_base_time = GST_CLOCK_TIME_NONE;
+    player->has_desired_base_time = false;
+    player->desired_base_time = GST_CLOCK_TIME_NONE;
     return player;
 
 fail_deinit_error_notifier:
@@ -1394,6 +1571,10 @@ void gstplayer_destroy(struct gstplayer *player) {
     notifier_deinit(&player->error_notifier);
     notifier_deinit(&player->eos_notifier);
     maybe_deinit(player);
+    if (player->sync_clock != NULL) {
+        gst_object_unref(player->sync_clock);
+        player->sync_clock = NULL;
+    }
     pthread_mutex_destroy(&player->lock);
     if (player->headers != NULL) {
         gst_structure_free(player->headers);
@@ -1434,6 +1615,31 @@ int gstplayer_initialize(struct gstplayer *player) {
 int gstplayer_play(struct gstplayer *player) {
     GST_PLOG(player, "API", "gstplayer_play() called (is_live=%d, curr_state=%s)",
         player->is_live, PLAYPAUSE_STATE_AS_STRING(player->playpause_state));
+
+    if (player->sync_mode && player->pipeline != NULL) {
+        GstState current = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
+
+        gst_element_get_state(player->pipeline, &current, &pending, 0);
+        bool is_playing = pending == GST_STATE_PLAYING || (current == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING);
+        if (player->playpause_state == kPlaying && is_playing) {
+            // Already playing on the shared timeline (e.g. video_player calling play() again): keep the shared base time.
+            GST_PLOG(player, "SYNC", "play() while playing in sync mode: keeping shared base time");
+            return 0;
+        }
+
+        // Resuming with a plain play(): leave sync mode. Let the pipeline manage base_time again and restart
+        // running-time from the current position, otherwise the old base time would make every frame late.
+        int64_t position = gstplayer_get_position(player);
+        GST_PLOG_WARN(player, "SYNC", "play() in sync mode while not playing: leaving sync mode (resume at %" PRId64 " ms, unsynced)",
+            position);
+        player->sync_mode = false;
+        player->has_desired_base_time = false;
+        gst_element_set_start_time(player->pipeline, 0);
+        player->has_desired_position = true;
+        player->desired_position_ms = position >= 0 ? position : 0;
+        player->do_fast_seeking = false;
+    }
+
     player->is_eos = false;
     player->playpause_state = kPlaying;
     player->direction = kForward;
@@ -1443,6 +1649,7 @@ int gstplayer_play(struct gstplayer *player) {
 int gstplayer_pause(struct gstplayer *player) {
     GST_PLOG(player, "API", "gstplayer_pause() called (is_live=%d, curr_state=%s)",
         player->is_live, PLAYPAUSE_STATE_AS_STRING(player->playpause_state));
+    player->has_desired_base_time = false;
     player->playpause_state = kPaused;
     player->direction = kForward;
     return apply_playback_state(player);
@@ -1507,6 +1714,10 @@ int64_t gstplayer_get_position(struct gstplayer *player) {
 int gstplayer_seek_to(struct gstplayer *player, int64_t position, bool nearest_keyframe) {
     GST_PLOG(player, "API", "gstplayer_seek_to(%" PRId64 " ms, nearest_keyframe=%d) called",
         position, nearest_keyframe);
+    if (player->sync_mode) {
+        GST_PLOG_WARN(player, "SYNC", "seekTo in sync mode: running-time restarts at 0 but the shared base time is kept, "
+            "playback will be out of sync. Use playAt with a position to seek synchronously.");
+    }
     player->is_eos = false;
     player->has_desired_position = true;
     player->desired_position_ms = position;
@@ -1563,6 +1774,89 @@ int gstplayer_step_backward(struct gstplayer *player) {
     }
 
     return 0;
+}
+
+void gstplayer_set_sync_clock(struct gstplayer *player, GstClock *clock, int64_t latency_ns) {
+    GstClockTime latency;
+
+    ASSERT_NOT_NULL(player);
+
+    latency = latency_ns >= 0 ? (GstClockTime) latency_ns : GST_CLOCK_TIME_NONE;
+
+    GST_PLOG(player, "API", "gstplayer_set_sync_clock(clock=%s, latency=%" GST_TIME_FORMAT ") called (sync_mode=%d)",
+        clock != NULL ? GST_OBJECT_NAME(clock) : "auto", GST_TIME_ARGS(latency), player->sync_mode);
+
+    if (clock != player->sync_clock) {
+        if (clock != NULL) {
+            gst_object_ref(clock);
+        }
+        if (player->sync_clock != NULL) {
+            gst_object_unref(player->sync_clock);
+        }
+        player->sync_clock = clock;
+
+        if (player->pipeline != NULL) {
+            if (clock != NULL) {
+                gst_pipeline_use_clock(GST_PIPELINE(player->pipeline), clock);
+            } else {
+                gst_pipeline_auto_clock(GST_PIPELINE(player->pipeline));
+            }
+
+            // The pipeline only (re)selects its clock on PAUSED -> PLAYING. We don't force a state change here:
+            // the old clock keeps running locally (a dead master doesn't stop playback), and the base time of
+            // the new clock domain has to be chosen by the application anyway (playAt).
+            if (player->playpause_state == kPlaying) {
+                GST_PLOG_WARN(player, "SYNC", "Clock changed while playing: new clock takes effect at the next playAt/pause+play");
+            }
+        }
+    }
+
+    if (latency != player->sync_latency) {
+        player->sync_latency = latency;
+        if (player->pipeline != NULL) {
+            // GST_CLOCK_TIME_NONE restores the automatically computed latency.
+            gst_pipeline_set_latency(GST_PIPELINE(player->pipeline), latency);
+        }
+    }
+}
+
+int gstplayer_play_at(struct gstplayer *player, int64_t base_time_ns, int64_t position_ms) {
+    ASSERT_NOT_NULL(player);
+
+    GST_PLOG(player, "API", "gstplayer_play_at(base_time=%" GST_TIME_FORMAT ", position=%" PRId64 " ms) called (is_live=%d, sync_mode=%d)",
+        GST_TIME_ARGS((GstClockTime) base_time_ns), position_ms, player->is_live, player->sync_mode);
+
+    if (base_time_ns < 0) {
+        return EINVAL;
+    }
+
+    if (player->pipeline == NULL) {
+        GST_PLOG_ERR(player, "SYNC", "gstplayer_play_at called on an uninitialized player");
+        return EINVAL;
+    }
+
+    if (player->sync_clock != NULL && !gst_clock_is_synced(player->sync_clock)) {
+        GST_PLOG_WARN(player, "SYNC", "Clock %s is not synced yet, start time may be inaccurate", GST_OBJECT_NAME(player->sync_clock));
+    }
+
+    if (position_ms >= 0) {
+        player->has_desired_position = true;
+        player->desired_position_ms = position_ms;
+        player->do_fast_seeking = false;
+    }
+
+    player->is_eos = false;
+    player->playpause_state = kPlaying;
+    player->direction = kForward;
+    player->has_desired_base_time = true;
+    player->desired_base_time = (GstClockTime) base_time_ns;
+
+    int ok = apply_playback_state(player);
+    if (ok != 0) {
+        // don't let a later, unrelated apply_playback_state pick up a stale base time.
+        player->has_desired_base_time = false;
+    }
+    return ok;
 }
 
 struct notifier *gstplayer_get_video_info_notifier(struct gstplayer *player) {

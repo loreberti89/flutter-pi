@@ -8,6 +8,7 @@
 #include <pthread.h>
 
 #include <gst/gst.h>
+#include <gst/net/gstnet.h>
 #include <gst/video/video-info.h>
 
 #include "flutter-pi.h"
@@ -59,6 +60,16 @@ static struct plugin {
     struct flutterpi *flutterpi;
     bool initialized;
     struct list_head players;
+
+    /// Shared network clock (GstNetClientClock) used by all players, or NULL for the default clock.
+    /// Owned reference, protected by @ref lock.
+    GstClock *net_clock;
+    char *net_clock_address;
+    int net_clock_port;
+    gulong net_clock_synced_handler;
+
+    /// Fixed pipeline latency in ns applied to all players, or -1 for the automatic latency. Protected by @ref lock.
+    int64_t net_clock_latency_ns;
 } plugin;
 
 DEFINE_LOCK_OPS(plugin, lock);
@@ -129,6 +140,46 @@ static void remove_player_locked(struct gstplayer_meta *meta) {
 
 static struct gstplayer_meta *get_meta(struct gstplayer *player) {
     return (struct gstplayer_meta *) gstplayer_get_userdata_locked(player);
+}
+
+/// Apply the shared net clock (if any) and fixed latency to a player that was just created.
+/// Must be called before @ref gstplayer_initialize so the clock is set before the first PAUSED -> PLAYING.
+static void apply_net_clock_to_player(struct gstplayer *player) {
+    plugin_lock(&plugin);
+    // gstplayer_set_sync_clock doesn't call back into the plugin, so holding the plugin lock is fine.
+    gstplayer_set_sync_clock(player, plugin.net_clock, plugin.net_clock_latency_ns);
+    plugin_unlock(&plugin);
+}
+
+/// Apply the shared net clock / latency to all existing players. Assumes the plugin is locked.
+static void apply_net_clock_to_all_players_locked() {
+    ASSERT_MUTEX_LOCKED(plugin.lock);
+    list_for_each_entry(struct gstplayer_meta, meta, &plugin.players, entry) {
+        gstplayer_set_sync_clock(meta->player, plugin.net_clock, plugin.net_clock_latency_ns);
+    }
+}
+
+/// Drop the plugin's reference to the shared net clock. Assumes the plugin is locked.
+/// Players keep their own reference until they are given another clock or destroyed.
+static void release_net_clock_locked() {
+    ASSERT_MUTEX_LOCKED(plugin.lock);
+    if (plugin.net_clock != NULL) {
+        if (plugin.net_clock_synced_handler != 0) {
+            g_signal_handler_disconnect(plugin.net_clock, plugin.net_clock_synced_handler);
+            plugin.net_clock_synced_handler = 0;
+        }
+        gst_object_unref(plugin.net_clock);
+        plugin.net_clock = NULL;
+    }
+    free(plugin.net_clock_address);
+    plugin.net_clock_address = NULL;
+    plugin.net_clock_port = 0;
+}
+
+/// Called on the net clock's internal thread when its synchronization state changes. Only logs.
+static void on_net_clock_synced(GstClock *clock, gboolean synced, gpointer userdata) {
+    (void) userdata;
+    GST_PLUG_LOG("[SYNC] Net clock %s is now %s", GST_OBJECT_NAME(clock), synced ? "SYNCED" : "NOT synced");
 }
 
 /// Get the player id from the given arg, which is a kStdMap.
@@ -691,6 +742,9 @@ invalid_format_hint:
     if (ok != 0) {
         goto fail_remove_player;
     }
+
+    // Use the shared net clock (if any) from the very first PAUSED -> PLAYING transition.
+    apply_net_clock_to_player(player);
 
     // Finally, start initializing
     ok = gstplayer_initialize(player);
@@ -1293,6 +1347,9 @@ invalid_headers:
         goto fail_remove_player;
     }
 
+    // Use the shared net clock (if any) from the very first PAUSED -> PLAYING transition.
+    apply_net_clock_to_player(player);
+
     // Finally, start initializing
     ok = gstplayer_initialize(player);
     if (ok != 0) {
@@ -1592,6 +1649,214 @@ static int on_step_backward_v2(const struct raw_std_value *arg, FlutterPlatformM
     return platch_respond_success_std(responsehandle, &STDNULL);
 }
 
+#define NET_CLOCK_MAX_LATENCY_MS 10000
+
+/// setNetClock {address: String, port: int, latencyMs: int?} -> bool (synced)
+static int on_set_net_clock_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *address_value, *port_value, *latency_value;
+    GstClock *clock;
+    char *address;
+    int64_t port, latency_ns;
+    gboolean synced;
+    int ok;
+
+    ok = ensure_initialized();
+    if (ok != 0) {
+        return respond_init_failed_v2(responsehandle);
+    }
+
+    if (!raw_std_value_is_map(arg)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg` to be a Map.");
+    }
+
+    address_value = raw_std_map_find_str(arg, "address");
+    if (address_value == NULL || !raw_std_value_is_string(address_value) || raw_std_string_get_length(address_value) == 0 ||
+        raw_std_string_get_length(address_value) > 253) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['address']` to be a non-empty String (IP address).");
+    }
+
+    port_value = raw_std_map_find_str(arg, "port");
+    if (port_value == NULL || !raw_std_value_is_int(port_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['port']` to be an integer.");
+    }
+    port = raw_std_value_as_int(port_value);
+    if (port < 1 || port > 65535) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['port']` to be in range 1..65535.");
+    }
+
+    latency_value = raw_std_map_find_str(arg, "latencyMs");
+    if (latency_value == NULL || raw_std_value_is_null(latency_value)) {
+        latency_ns = -1;
+    } else if (raw_std_value_is_int(latency_value) && raw_std_value_as_int(latency_value) >= 0 &&
+               raw_std_value_as_int(latency_value) <= NET_CLOCK_MAX_LATENCY_MS) {
+        latency_ns = raw_std_value_as_int(latency_value) * (int64_t) GST_MSECOND;
+    } else {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['latencyMs']` to be null or an integer in range 0..10000.");
+    }
+
+    address = raw_std_string_dup(address_value);
+    if (address == NULL) {
+        return platch_respond_native_error_std(responsehandle, ENOMEM);
+    }
+
+    plugin_lock(&plugin);
+
+    if (plugin.net_clock != NULL && streq(plugin.net_clock_address, address) && plugin.net_clock_port == port) {
+        // Same master: keep the existing clock (and its sync state), only update the latency if needed.
+        free(address);
+
+        if (plugin.net_clock_latency_ns != latency_ns) {
+            plugin.net_clock_latency_ns = latency_ns;
+            apply_net_clock_to_all_players_locked();
+        }
+
+        synced = gst_clock_is_synced(plugin.net_clock);
+        GST_PLUG_LOG("[SYNC] setNetClock: already using %s:%" PRId64 " (synced=%d, latency=%" PRId64 " ns)", plugin.net_clock_address, port,
+            synced, latency_ns);
+
+        plugin_unlock(&plugin);
+        return platch_respond_success_std(responsehandle, &STDBOOL(synced));
+    }
+
+    // Doesn't block for IP literals: the clock syncs in its own thread. We never wait for sync here
+    // (no gst_clock_wait_for_sync on the platform thread): the app can poll isNetClockSynced instead.
+    clock = gst_net_client_clock_new("flutterpi-netclock", address, (gint) port, 0);
+    if (clock == NULL) {
+        plugin_unlock(&plugin);
+        GST_PLUG_ERR("[SYNC] setNetClock: could not create GstNetClientClock for %s:%" PRId64, address, port);
+        free(address);
+        return platch_respond_native_error_std(responsehandle, EIO);
+    }
+
+    release_net_clock_locked();
+
+    plugin.net_clock = clock;
+    plugin.net_clock_address = address;
+    plugin.net_clock_port = (int) port;
+    plugin.net_clock_latency_ns = latency_ns;
+    plugin.net_clock_synced_handler = g_signal_connect(clock, "synced", G_CALLBACK(on_net_clock_synced), NULL);
+
+    apply_net_clock_to_all_players_locked();
+
+    synced = gst_clock_is_synced(clock);
+
+    GST_PLUG_LOG("[SYNC] setNetClock: now using net clock %s:%" PRId64 " (synced=%d, latency=%" PRId64 " ns, %d player(s))", address, port,
+        synced, latency_ns, list_length(&plugin.players));
+
+    plugin_unlock(&plugin);
+
+    return platch_respond_success_std(responsehandle, &STDBOOL(synced));
+}
+
+/// clearNetClock (no args) -> null
+static int on_clear_net_clock_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    (void) arg;
+
+    plugin_lock(&plugin);
+
+    release_net_clock_locked();
+    plugin.net_clock_latency_ns = -1;
+    apply_net_clock_to_all_players_locked();
+
+    plugin_unlock(&plugin);
+
+    GST_PLUG_LOG("[SYNC] clearNetClock: players reverted to automatic clock selection");
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
+/// getNetClockTime (no args) -> int (ns, net clock time domain)
+static int on_get_net_clock_time_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    GstClockTime time;
+    GstClock *clock;
+
+    (void) arg;
+
+    plugin_lock(&plugin);
+    clock = plugin.net_clock != NULL ? gst_object_ref(plugin.net_clock) : NULL;
+    plugin_unlock(&plugin);
+
+    if (clock == NULL) {
+        return platch_respond_error_std(responsehandle, "no-net-clock", "No net clock configured. Call setNetClock first.", NULL);
+    }
+
+    time = gst_clock_get_time(clock);
+    gst_object_unref(clock);
+
+    return platch_respond_success_std(responsehandle, &STDINT64((int64_t) time));
+}
+
+/// isNetClockSynced (no args) -> bool (false if no net clock is configured)
+static int on_is_net_clock_synced_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    gboolean synced;
+
+    (void) arg;
+
+    plugin_lock(&plugin);
+    synced = plugin.net_clock != NULL ? gst_clock_is_synced(plugin.net_clock) : FALSE;
+    plugin_unlock(&plugin);
+
+    return platch_respond_success_std(responsehandle, &STDBOOL(synced));
+}
+
+/// playAt {textureId: int, baseTime: int (ns), position: int? (ms)} -> null
+static int on_play_at_v2(const struct raw_std_value *arg, FlutterPlatformMessageResponseHandle *responsehandle) {
+    const struct raw_std_value *texture_id_value, *base_time_value, *position_value;
+    struct gstplayer *player;
+    int64_t base_time, position;
+    bool has_net_clock;
+    int ok;
+
+    if (!raw_std_value_is_map(arg)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg` to be a Map.");
+    }
+
+    texture_id_value = raw_std_map_find_str(arg, "textureId");
+    if (texture_id_value == NULL || !raw_std_value_is_int(texture_id_value)) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['textureId']` to be an integer.");
+    }
+
+    base_time_value = raw_std_map_find_str(arg, "baseTime");
+    if (base_time_value == NULL || !raw_std_value_is_int(base_time_value) || raw_std_value_as_int(base_time_value) <= 0) {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['baseTime']` to be a positive integer (nanoseconds).");
+    }
+    base_time = raw_std_value_as_int(base_time_value);
+
+    position_value = raw_std_map_find_str(arg, "position");
+    if (position_value == NULL || raw_std_value_is_null(position_value)) {
+        position = -1;
+    } else if (raw_std_value_is_int(position_value) && raw_std_value_as_int(position_value) >= 0) {
+        position = raw_std_value_as_int(position_value);
+    } else {
+        return platch_respond_illegal_arg_std(responsehandle, "Expected `arg['position']` to be null or a non-negative integer (ms).");
+    }
+
+    player = get_player_from_texture_id_with_custom_errmsg(
+        raw_std_value_as_int(texture_id_value),
+        responsehandle,
+        "Expected `arg['textureId']` to be a valid texture id."
+    );
+    if (player == NULL) {
+        return 0;
+    }
+
+    plugin_lock(&plugin);
+    has_net_clock = plugin.net_clock != NULL;
+    plugin_unlock(&plugin);
+
+    if (!has_net_clock) {
+        return platch_respond_error_std(responsehandle, "no-net-clock", "No net clock configured. Call setNetClock first.", NULL);
+    }
+
+    ok = gstplayer_play_at(player, base_time, position);
+    if (ok != 0) {
+        GST_PLUG_ERR("on_play_at_v2 FAILED for texture_id=%" PRId64 " (baseTime=%" PRId64 " ns, position=%" PRId64 " ms)",
+            gstplayer_get_texture_id(player), base_time, position);
+        return platch_respond_native_error_std(responsehandle, ok);
+    }
+
+    return platch_respond_success_std(responsehandle, &STDNULL);
+}
+
 static int on_receive_method_channel_v2(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *responsehandle) {
     const struct raw_std_value *envelope, *method, *arg;
 
@@ -1639,6 +1904,16 @@ static int on_receive_method_channel_v2(char *channel, struct platch_obj *object
         return on_step_backward_v2(arg, responsehandle);
     } else if (raw_std_string_equals(method, "fastSeek")) {
         return on_fast_seek_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "setNetClock")) {
+        return on_set_net_clock_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "clearNetClock")) {
+        return on_clear_net_clock_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "getNetClockTime")) {
+        return on_get_net_clock_time_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "isNetClockSynced")) {
+        return on_is_net_clock_synced_v2(arg, responsehandle);
+    } else if (raw_std_string_equals(method, "playAt")) {
+        return on_play_at_v2(arg, responsehandle);
     } else {
         return platch_respond_not_implemented(responsehandle);
     }
@@ -1651,6 +1926,11 @@ enum plugin_init_result gstplayer_plugin_init(struct flutterpi *flutterpi, void 
 
     plugin.flutterpi = flutterpi;
     plugin.initialized = false;
+    plugin.net_clock = NULL;
+    plugin.net_clock_address = NULL;
+    plugin.net_clock_port = 0;
+    plugin.net_clock_synced_handler = 0;
+    plugin.net_clock_latency_ns = -1;
 
     ok = pthread_mutex_init(&plugin.lock, get_default_mutex_attrs());
     if (ok != 0) {
@@ -1789,6 +2069,9 @@ void gstplayer_plugin_deinit(struct flutterpi *flutterpi, void *userdata) {
         // will also remove the player from the player list.
         dispose_player(meta->player, true, true);
     }
+
+    // Players are gone (each dropped its own clock ref), release ours before gst_deinit.
+    release_net_clock_locked();
 
     if (plugin.initialized) {
         gst_deinit();

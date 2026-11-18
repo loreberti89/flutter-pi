@@ -710,6 +710,81 @@ fail_close_fds:
     return 0;
 }
 
+/*
+ * Raspberry Pi HEVC decoder (rpi-hevc-dec via v4l2slh265dec) output: NV12 stored in 128 byte wide
+ * columns (V4L2 'Nc12', GStreamer NV12_128C8), luma and chroma in two separate dmabufs, with
+ * bytesperline == width. GStreamer itself maps it to drm-format NV12:DRM_FORMAT_MOD_BROADCOM_SAND128,
+ * which Mesa (v3d) imports as an external-only texture.
+ *
+ * GST_VIDEO_FORMAT_NV12_128C8 only exists in Raspberry Pi GStreamer builds, so it's looked up by name.
+ */
+static bool is_broadcom_sand128_format(const GstVideoInfo *info) {
+#ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+    GstVideoFormat sand128_format = gst_video_format_from_string("NV12_128C8");
+    return sand128_format != GST_VIDEO_FORMAT_UNKNOWN && GST_VIDEO_INFO_FORMAT(info) == sand128_format;
+#else
+    (void) info;
+    return false;
+#endif
+}
+
+#ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+static int get_sand128_plane_infos(GstBuffer *buffer, const GstVideoInfo *info, struct plane_info plane_infos[MAX_N_PLANES]) {
+    int n_planes, ok, i;
+
+    // The video meta of these buffers doesn't describe plain byte offsets/strides,
+    // so take the planes straight from the per-plane dmabuf memories.
+    n_planes = GST_VIDEO_INFO_N_PLANES(info);
+    if (n_planes != 2 || gst_buffer_n_memory(buffer) != 2) {
+        LOG_ERROR(
+            "NV12_128C8 video frame: expected 2 planes in 2 memories, got %d planes in %u memories.\n",
+            n_planes,
+            gst_buffer_n_memory(buffer)
+        );
+        return EINVAL;
+    }
+
+    for (i = 0; i < n_planes; i++) {
+        GstMemory *memory = gst_buffer_peek_memory(buffer, i);
+
+        if (!gst_is_dmabuf_memory(memory)) {
+            LOG_ERROR("NV12_128C8 video frame plane %d is not backed by a dmabuf.\n", i);
+            ok = EINVAL;
+            goto fail_close_fds;
+        }
+
+        ok = gst_dmabuf_memory_get_fd(memory);
+        if (ok < 0) {
+            LOG_ERROR("Could not get gstreamer memory as dmabuf.\n");
+            ok = EIO;
+            goto fail_close_fds;
+        }
+
+        ok = dup(ok);
+        if (ok < 0) {
+            ok = errno;
+            LOG_ERROR("Could not dup fd. dup: %s\n", strerror(ok));
+            goto fail_close_fds;
+        }
+
+        plane_infos[i].fd = ok;
+        plane_infos[i].offset = memory->offset;
+        // bytesperline of both planes is the frame width; the column height is the plane height.
+        plane_infos[i].pitch = GST_VIDEO_INFO_WIDTH(info);
+        plane_infos[i].has_modifier = true;
+        plane_infos[i].modifier = DRM_FORMAT_MOD_BROADCOM_SAND128;
+    }
+
+    return 0;
+
+fail_close_fds:
+    for (int j = 0; j < i; j++) {
+        close(plane_infos[j].fd);
+    }
+    return ok;
+}
+#endif
+
 static uint32_t drm_format_from_gst_info(const GstVideoInfo *info) {
     switch (GST_VIDEO_INFO_FORMAT(info)) {
         case GST_VIDEO_FORMAT_YUY2: return DRM_FORMAT_YUYV;
@@ -882,8 +957,19 @@ struct video_frame *frame_new(struct frame_interface *interface, GstSample *samp
     height = GST_VIDEO_INFO_HEIGHT(info);
     n_planes = GST_VIDEO_INFO_N_PLANES(info);
 
-    // query the drm format for this sample
-    drm_format = drm_format_from_gst_info(info);
+    // query the drm format (and modifier) for this sample
+    uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+    bool is_sand128 = is_broadcom_sand128_format(info);
+    if (is_sand128) {
+#ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+        drm_format = DRM_FORMAT_NV12;
+        modifier = DRM_FORMAT_MOD_BROADCOM_SAND128;
+#else
+        UNREACHABLE();
+#endif
+    } else {
+        drm_format = drm_format_from_gst_info(info);
+    }
     if (drm_format == DRM_FORMAT_INVALID) {
         LOG_ERROR("Video format has no EGL equivalent.\n");
         return NULL;
@@ -891,16 +977,16 @@ struct video_frame *frame_new(struct frame_interface *interface, GstSample *samp
 
     bool external_only;
     for_each_format_in_frame_interface(i, format, interface) {
-        if (format->format == drm_format && format->modifier == DRM_FORMAT_MOD_LINEAR) {
+        if (format->format == drm_format && format->modifier == modifier) {
             external_only = format->external_only;
             goto format_supported;
         }
     }
 
     LOG_ERROR(
-        "Video format is not supported by EGL: %" DRM_FOURCC_FORMAT " (modifier: %" PRIu64 ").\n",
+        "Video format is not supported by EGL: %" DRM_FOURCC_FORMAT " (modifier: 0x%016" PRIx64 ").\n",
         DRM_FOURCC_ARGS(drm_format),
-        (uint64_t) DRM_FORMAT_MOD_LINEAR
+        modifier
     );
     return NULL;
 
@@ -921,7 +1007,15 @@ format_supported:
         return NULL;
     }
 
+#ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+    if (is_sand128) {
+        ok = get_sand128_plane_infos(buffer, info, planes);
+    } else {
+        ok = get_plane_infos(buffer, info, interface->gbm_device, planes);
+    }
+#else
     ok = get_plane_infos(buffer, info, interface->gbm_device, planes);
+#endif
     if (ok != 0) {
         goto fail_free_frame;
     }

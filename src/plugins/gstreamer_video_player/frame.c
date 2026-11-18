@@ -767,10 +767,26 @@ static int get_sand128_plane_infos(GstBuffer *buffer, const GstVideoInfo *info, 
             goto fail_close_fds;
         }
 
+        // Mesa (v3d) reads the pitch of a DRM_FORMAT_MOD_BROADCOM_SAND128 plane (without modifier
+        // parameter) as the column height in lines: column N starts at N * pitch * 128 bytes.
+        // Each plane is its own column image, so the column height is plane size / (columns * 128),
+        // which also covers padded coded heights (e.g. 1080p decoded as 1088 lines).
+        size_t n_columns = (GST_VIDEO_INFO_WIDTH(info) + 127) / 128;
+        if (n_columns == 0 || memory->size % (n_columns * 128) != 0) {
+            LOG_ERROR(
+                "NV12_128C8 video frame plane %d: size %zu is not a multiple of %zu columns of 128 bytes.\n",
+                i,
+                memory->size,
+                n_columns
+            );
+            close(ok);
+            ok = EINVAL;
+            goto fail_close_fds;
+        }
+
         plane_infos[i].fd = ok;
         plane_infos[i].offset = memory->offset;
-        // bytesperline of both planes is the frame width; the column height is the plane height.
-        plane_infos[i].pitch = GST_VIDEO_INFO_WIDTH(info);
+        plane_infos[i].pitch = memory->size / (n_columns * 128);
         plane_infos[i].has_modifier = true;
         plane_infos[i].modifier = DRM_FORMAT_MOD_BROADCOM_SAND128;
     }

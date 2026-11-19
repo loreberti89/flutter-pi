@@ -1444,11 +1444,15 @@ format_supported:
     // On the Pi 4, hand flutter a one-time RGBA copy of SAND128 frames (see sand128_copy_frame).
     // If the copy fails, flutter samples the image texture directly, as for every other format.
     GLuint image_texture = 0;
-    // 0 x 0 (as always for the EGL image): flutter wraps the texture with the size of the widget, and
-    // skia rejects it when the widget is larger than the GPU's max texture size (e.g. a videowall
-    // crop, scaled well beyond the screen). The copy has a known size, so it's passed along.
+    // 0 x 0: flutter wraps the texture with the size of the widget, and skia rejects it when the widget
+    // is larger than the GPU's max texture size (e.g. a videowall crop, scaled well beyond the screen).
+    // SAND128 frames (the HEVC videowall) pass their real size instead; other formats are unchanged.
     int texture_width = 0, texture_height = 0;
 #ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+    if (is_sand128) {
+        texture_width = width;
+        texture_height = height;
+    }
     if (is_sand128 && target == GL_TEXTURE_EXTERNAL_OES && sand128_copy_setup(interface)) {
         // The copy's longer side is at most the display's longer side (independent of the rotation):
         // more resolution than that never reaches the screen, and on the Pi 4 a 4K RGBA copy alone takes

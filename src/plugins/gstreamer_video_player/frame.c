@@ -1444,6 +1444,10 @@ format_supported:
     // On the Pi 4, hand flutter a one-time RGBA copy of SAND128 frames (see sand128_copy_frame).
     // If the copy fails, flutter samples the image texture directly, as for every other format.
     GLuint image_texture = 0;
+    // 0 x 0 (as always for the EGL image): flutter wraps the texture with the size of the widget, and
+    // skia rejects it when the widget is larger than the GPU's max texture size (e.g. a videowall
+    // crop, scaled well beyond the screen). The copy has a known size, so it's passed along.
+    int texture_width = 0, texture_height = 0;
 #ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
     if (is_sand128 && target == GL_TEXTURE_EXTERNAL_OES && sand128_copy_setup(interface)) {
         // The copy's longer side is at most the display's longer side (independent of the rotation):
@@ -1462,6 +1466,8 @@ format_supported:
             image_texture = texture;
             texture = copy;
             target = GL_TEXTURE_2D;
+            texture_width = copy_width;
+            texture_height = copy_height;
         }
     }
 #endif
@@ -1489,8 +1495,8 @@ format_supported:
     frame->gl_frame.target = target;
     frame->gl_frame.name = texture;
     frame->gl_frame.format = GL_RGBA8_OES;
-    frame->gl_frame.width = 0;
-    frame->gl_frame.height = 0;
+    frame->gl_frame.width = texture_width;
+    frame->gl_frame.height = texture_height;
     return frame;
 
 fail_unbind_texture:
@@ -1519,6 +1525,14 @@ void frame_destroy(struct video_frame *frame) {
     EGLBoolean egl_ok;
     int ok;
 
+    // Flutter may release a frame on its raster thread (e.g. right away when skia rejects the texture):
+    // restore whatever was current there afterwards, otherwise the raster thread loses its context and
+    // surface (eglSwapBuffers: EGL_BAD_SURFACE) and the display freezes.
+    EGLDisplay previous_display = eglGetCurrentDisplay();
+    EGLContext previous_context = eglGetCurrentContext();
+    EGLSurface previous_draw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface previous_read = eglGetCurrentSurface(EGL_READ);
+
     frame_interface_lock(frame->interface);
     egl_ok = eglMakeCurrent(frame->interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, frame->interface->context);
     ASSERT_EGL_TRUE(egl_ok);
@@ -1528,7 +1542,11 @@ void frame_destroy(struct video_frame *frame) {
         glDeleteTextures(1, &frame->image_texture);
     }
     assert(GL_NO_ERROR == glGetError());
-    egl_ok = eglMakeCurrent(frame->interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (previous_context != EGL_NO_CONTEXT) {
+        egl_ok = eglMakeCurrent(previous_display, previous_draw, previous_read, previous_context);
+    } else {
+        egl_ok = eglMakeCurrent(frame->interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
     ASSERT_EGL_TRUE(egl_ok);
     frame_interface_unlock(frame->interface);
 

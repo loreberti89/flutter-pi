@@ -1044,6 +1044,15 @@ struct gl_renderer *flutterpi_get_gl_renderer(struct flutterpi *flutterpi) {
     return flutterpi->gl_renderer;
 }
 
+void flutterpi_get_display_size(struct flutterpi *flutterpi, int *width_out, int *height_out) {
+    struct view_geometry geometry;
+
+    ASSERT_NOT_NULL(flutterpi);
+    compositor_get_view_geometry(flutterpi->compositor, &geometry);
+    *width_out = (int) geometry.display_size.x;
+    *height_out = (int) geometry.display_size.y;
+}
+
 void flutterpi_set_pointer_kind(struct flutterpi *flutterpi, enum pointer_kind kind) {
     return compositor_set_cursor(flutterpi->compositor, false, false, true, kind, false, VEC2F(0, 0));
 }

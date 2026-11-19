@@ -225,7 +225,8 @@ struct egl_modified_format {
 
 struct frame_interface;
 
-struct frame_interface *frame_interface_new(struct gl_renderer *renderer);
+/// [display_width] x [display_height]: size of the output display, bounds the copies of SAND128 frames.
+struct frame_interface *frame_interface_new(struct gl_renderer *renderer, int display_width, int display_height);
 
 ATTR_PURE int frame_interface_get_n_formats(struct frame_interface *interface);
 

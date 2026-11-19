@@ -1416,7 +1416,9 @@ static struct gstplayer *gstplayer_new(struct flutterpi *flutterpi, const char *
     if (texture == NULL)
         goto fail_free_player;
 
-    frame_interface = frame_interface_new(flutterpi_get_gl_renderer(flutterpi));
+    int display_width, display_height;
+    flutterpi_get_display_size(flutterpi, &display_width, &display_height);
+    frame_interface = frame_interface_new(flutterpi_get_gl_renderer(flutterpi), display_width, display_height);
     if (frame_interface == NULL)
         goto fail_destroy_texture;
 

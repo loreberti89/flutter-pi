@@ -194,6 +194,9 @@ bool flutterpi_has_gl_renderer(struct flutterpi *flutterpi);
 
 struct gl_renderer *flutterpi_get_gl_renderer(struct flutterpi *flutterpi);
 
+/// Size of the display flutter-pi outputs to, in physical pixels (not rotated).
+void flutterpi_get_display_size(struct flutterpi *flutterpi, int *width_out, int *height_out);
+
 void flutterpi_set_pointer_kind(struct flutterpi *flutterpi, enum pointer_kind kind);
 
 void flutterpi_trace_event_instant(struct flutterpi *flutterpi, const char *name);

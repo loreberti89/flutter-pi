@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <unistd.h>
 
@@ -40,6 +41,9 @@ struct video_frame {
     EGLImageKHR image;
     size_t width, height;
 
+    /// Texture bound to [image] when [gl_frame] is a copy of it (see sand128_copy_frame), 0 otherwise.
+    GLuint image_texture;
+
     struct gl_texture_frame gl_frame;
 };
 
@@ -64,6 +68,14 @@ struct frame_interface {
 
     int n_formats;
     struct egl_modified_format *formats;
+
+    /// SAND128 frame copy (see sand128_copy_frame), lazily set up in [context].
+    /// sand_copy_state: 0 = not decided yet, 1 = enabled, -1 = disabled.
+    int sand_copy_state;
+    /// Longer side of the display: copies are never larger than that. 0 = unknown, copy at full size.
+    int sand_copy_max_side;
+    GLuint sand_program, sand_fbo;
+    GLint sand_pos_location, sand_tex_location;
 
     refcount_t n_refs;
 };
@@ -180,7 +192,7 @@ fail:
 }
 #endif
 
-struct frame_interface *frame_interface_new(struct gl_renderer *renderer) {
+struct frame_interface *frame_interface_new(struct gl_renderer *renderer, int display_width, int display_height) {
     struct frame_interface *interface;
     struct gbm_device *gbm_device;
     EGLBoolean egl_ok;
@@ -300,6 +312,12 @@ struct frame_interface *frame_interface_new(struct gl_renderer *renderer) {
 #endif
     interface->n_formats = n_formats;
     interface->formats = formats;
+    interface->sand_copy_state = 0;
+    interface->sand_copy_max_side = MAX(display_width, display_height);
+    interface->sand_program = 0;
+    interface->sand_fbo = 0;
+    interface->sand_pos_location = -1;
+    interface->sand_tex_location = -1;
     interface->n_refs = REFCOUNT_INIT_1;
     return interface;
 
@@ -315,6 +333,15 @@ fail_free:
 
 void frame_interface_destroy(struct frame_interface *interface) {
     EGLBoolean egl_ok;
+
+    if (interface->sand_program != 0 || interface->sand_fbo != 0) {
+        egl_ok = eglMakeCurrent(interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, interface->context);
+        if (egl_ok == EGL_TRUE) {
+            if (interface->sand_fbo != 0) glDeleteFramebuffers(1, &interface->sand_fbo);
+            if (interface->sand_program != 0) glDeleteProgram(interface->sand_program);
+            eglMakeCurrent(interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        }
+    }
 
     pthread_mutex_destroy(&interface->context_lock);
     egl_ok = eglDestroyContext(interface->display, interface->context);
@@ -712,9 +739,11 @@ fail_close_fds:
 
 /*
  * Raspberry Pi HEVC decoder (rpi-hevc-dec via v4l2slh265dec) output: NV12 stored in 128 byte wide
- * columns (V4L2 'Nc12', GStreamer NV12_128C8), luma and chroma in two separate dmabufs, with
- * bytesperline == width. GStreamer itself maps it to drm-format NV12:DRM_FORMAT_MOD_BROADCOM_SAND128,
- * which Mesa (v3d) imports as an external-only texture.
+ * columns (GStreamer NV12_128C8). GStreamer itself maps it to drm-format
+ * NV12:DRM_FORMAT_MOD_BROADCOM_SAND128, which Mesa (v3d) imports as an external-only texture.
+ * Two layouts exist, depending on the V4L2 format the decoder negotiates:
+ *   - 'Nc12' (e.g. Pi 4, kernel 6.18): luma and chroma in two separate dmabufs, each its own column image.
+ *   - 'NC12' (e.g. Pi 5): one dmabuf, each column holds the luma lines followed by the chroma lines.
  *
  * GST_VIDEO_FORMAT_NV12_128C8 only exists in Raspberry Pi GStreamer builds, so it's looked up by name.
  */
@@ -730,27 +759,58 @@ static bool is_broadcom_sand128_format(const GstVideoInfo *info) {
 
 #ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
 static int get_sand128_plane_infos(GstBuffer *buffer, const GstVideoInfo *info, struct plane_info plane_infos[MAX_N_PLANES]) {
+    unsigned n_memories;
+    size_t n_columns;
     int n_planes, ok, i;
 
     // The video meta of these buffers doesn't describe plain byte offsets/strides,
-    // so take the planes straight from the per-plane dmabuf memories.
+    // so take the planes straight from the dmabuf memories.
     n_planes = GST_VIDEO_INFO_N_PLANES(info);
-    if (n_planes != 2 || gst_buffer_n_memory(buffer) != 2) {
+    n_memories = gst_buffer_n_memory(buffer);
+    n_columns = (GST_VIDEO_INFO_WIDTH(info) + 127) / 128;
+    if (n_planes != 2 || (n_memories != 1 && n_memories != 2) || n_columns == 0) {
         LOG_ERROR(
-            "NV12_128C8 video frame: expected 2 planes in 2 memories, got %d planes in %u memories.\n",
+            "NV12_128C8 video frame: expected 2 planes in 1 or 2 memories, got %d planes in %u memories.\n",
             n_planes,
-            gst_buffer_n_memory(buffer)
+            n_memories
         );
         return EINVAL;
     }
 
     for (i = 0; i < n_planes; i++) {
-        GstMemory *memory = gst_buffer_peek_memory(buffer, i);
+        GstMemory *memory = gst_buffer_peek_memory(buffer, n_memories == 2 ? i : 0);
 
         if (!gst_is_dmabuf_memory(memory)) {
             LOG_ERROR("NV12_128C8 video frame plane %d is not backed by a dmabuf.\n", i);
             ok = EINVAL;
             goto fail_close_fds;
+        }
+
+        // Mesa (v3d) reads the pitch of a DRM_FORMAT_MOD_BROADCOM_SAND128 plane (without modifier
+        // parameter) as the column height in lines: column N starts at N * pitch * 128 bytes.
+        // The column height is memory size / (columns * 128), which also covers padded coded
+        // heights (e.g. 1080p decoded as 1088 lines).
+        if (memory->size % (n_columns * 128) != 0) {
+            LOG_ERROR(
+                "NV12_128C8 video frame plane %d: size %zu is not a multiple of %zu columns of 128 bytes.\n",
+                i,
+                memory->size,
+                n_columns
+            );
+            ok = EINVAL;
+            goto fail_close_fds;
+        }
+        size_t column_height = memory->size / (n_columns * 128);
+        size_t offset = memory->offset;
+
+        if (n_memories == 1 && i == 1) {
+            // Shared columns: luma lines, then half as many chroma lines.
+            if (column_height % 3 != 0) {
+                LOG_ERROR("NV12_128C8 video frame: column height %zu doesn't split into luma and chroma.\n", column_height);
+                ok = EINVAL;
+                goto fail_close_fds;
+            }
+            offset += column_height / 3 * 2 * 128;
         }
 
         ok = gst_dmabuf_memory_get_fd(memory);
@@ -767,26 +827,9 @@ static int get_sand128_plane_infos(GstBuffer *buffer, const GstVideoInfo *info, 
             goto fail_close_fds;
         }
 
-        // Mesa (v3d) reads the pitch of a DRM_FORMAT_MOD_BROADCOM_SAND128 plane (without modifier
-        // parameter) as the column height in lines: column N starts at N * pitch * 128 bytes.
-        // Each plane is its own column image, so the column height is plane size / (columns * 128),
-        // which also covers padded coded heights (e.g. 1080p decoded as 1088 lines).
-        size_t n_columns = (GST_VIDEO_INFO_WIDTH(info) + 127) / 128;
-        if (n_columns == 0 || memory->size % (n_columns * 128) != 0) {
-            LOG_ERROR(
-                "NV12_128C8 video frame plane %d: size %zu is not a multiple of %zu columns of 128 bytes.\n",
-                i,
-                memory->size,
-                n_columns
-            );
-            close(ok);
-            ok = EINVAL;
-            goto fail_close_fds;
-        }
-
         plane_infos[i].fd = ok;
-        plane_infos[i].offset = memory->offset;
-        plane_infos[i].pitch = memory->size / (n_columns * 128);
+        plane_infos[i].offset = offset;
+        plane_infos[i].pitch = column_height;
         plane_infos[i].has_modifier = true;
         plane_infos[i].modifier = DRM_FORMAT_MOD_BROADCOM_SAND128;
     }
@@ -798,6 +841,184 @@ fail_close_fds:
         close(plane_infos[j].fd);
     }
     return ok;
+}
+#endif
+
+#ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+/*
+ * SAND128 frames are external-only textures that Mesa (v3d) can't sample directly: it converts them
+ * into a shadow texture first. Because the image is imported (not a buffer Mesa allocated itself),
+ * Mesa redoes that conversion on every draw call while the texture is still bound, not once per
+ * frame. With any widget drawn on top of the video, Flutter issues several draws per frame and the
+ * 4K conversion runs several times: on the Pi 4 (V3D 4.x) that's ~8 render passes per frame and
+ * the video drops to 20 fps. The Pi 5 (V3D 7.x) is fast enough, so it keeps sampling the image.
+ *
+ * On V3D 4.x the frame is therefore converted once, here, into a plain RGBA texture that Mesa owns
+ * (scaled down to the display resolution), and Flutter samples that one instead.
+ */
+
+static const char *const sand128_copy_vertex_shader =
+    "attribute vec2 pos;\n"
+    "varying highp vec2 uv;\n"
+    "void main() {\n"
+    "    uv = pos * 0.5 + 0.5;\n"
+    "    gl_Position = vec4(pos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *const sand128_copy_fragment_shader =
+    "#extension GL_OES_EGL_image_external : require\n"
+    "precision mediump float;\n"
+    "uniform samplerExternalOES tex;\n"
+    "varying highp vec2 uv;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(tex, uv);\n"
+    "}\n";
+
+static GLuint sand128_compile_shader(GLenum type, const char *source) {
+    GLuint shader;
+    GLint ok;
+
+    shader = glCreateShader(type);
+    if (shader == 0) {
+        return 0;
+    }
+
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(shader, sizeof log, NULL, log);
+        LOG_ERROR("SAND128 copy: shader compilation failed: %s\n", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+/// Decides (once) whether SAND128 frames get copied and sets up the GL objects for it.
+/// Must be called with [interface->context] current. Returns true if frames should be copied.
+static bool sand128_copy_setup(struct frame_interface *interface) {
+    GLuint vertex_shader, fragment_shader, program;
+    GLint ok;
+
+    if (interface->sand_copy_state != 0) {
+        return interface->sand_copy_state > 0;
+    }
+    interface->sand_copy_state = -1;
+
+    const char *renderer = (const char *) glGetString(GL_RENDERER);
+    if (renderer == NULL || strstr(renderer, "V3D 4.") == NULL) {
+        LOG_DEBUG("SAND128 copy not needed on GPU \"%s\": video frames are sampled directly.\n", renderer ? renderer : "?");
+        return false;
+    }
+
+    vertex_shader = sand128_compile_shader(GL_VERTEX_SHADER, sand128_copy_vertex_shader);
+    fragment_shader = sand128_compile_shader(GL_FRAGMENT_SHADER, sand128_copy_fragment_shader);
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        goto fail_delete_shaders;
+    }
+
+    program = glCreateProgram();
+    if (program == 0) {
+        goto fail_delete_shaders;
+    }
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        LOG_ERROR("SAND128 copy: program link failed.\n");
+        glDeleteProgram(program);
+        return false;
+    }
+
+    interface->sand_program = program;
+    interface->sand_pos_location = glGetAttribLocation(program, "pos");
+    interface->sand_tex_location = glGetUniformLocation(program, "tex");
+    glGenFramebuffers(1, &interface->sand_fbo);
+    if (interface->sand_fbo == 0 || interface->sand_pos_location < 0) {
+        LOG_ERROR("SAND128 copy: couldn't set up framebuffer or shader attributes.\n");
+        return false;
+    }
+
+    LOG_DEBUG("SAND128 video frames are copied into RGBA textures on GPU \"%s\".\n", renderer);
+    interface->sand_copy_state = 1;
+    return true;
+
+fail_delete_shaders:
+    if (vertex_shader != 0) glDeleteShader(vertex_shader);
+    if (fragment_shader != 0) glDeleteShader(fragment_shader);
+    return false;
+}
+
+/// Renders the external texture [image_texture] into a new [width]x[height] RGBA texture (scaled if needed).
+/// Must be called with [interface->context] current. Returns 0 on failure.
+static GLuint sand128_copy_frame(struct frame_interface *interface, GLuint image_texture, int width, int height) {
+    // One triangle covering the whole viewport.
+    static const GLfloat vertices[] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+    GLuint texture;
+
+    glGenTextures(1, &texture);
+    if (texture == 0) {
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, interface->sand_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        LOG_ERROR("SAND128 copy: framebuffer incomplete for %dx%d RGBA texture.\n", width, height);
+        goto fail_detach;
+    }
+
+    glViewport(0, 0, width, height);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    // Every pixel gets overwritten: clearing just spares the GPU from loading the old contents.
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(interface->sand_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, image_texture);
+    glUniform1i(interface->sand_tex_location, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(interface->sand_pos_location, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glEnableVertexAttribArray(interface->sand_pos_location);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisableVertexAttribArray(interface->sand_pos_location);
+
+    // Unbind the image right away, so no later draw in this context triggers another conversion.
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glUseProgram(0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Submit now: the flutter raster thread samples the texture from another (shared) context.
+    glFlush();
+
+    if (glGetError() != GL_NO_ERROR) {
+        LOG_ERROR("SAND128 copy: GL error while copying the video frame.\n");
+        glDeleteTextures(1, &texture);
+        return 0;
+    }
+    return texture;
+
+fail_detach:
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteTextures(1, &texture);
+    return 0;
 }
 #endif
 
@@ -1220,10 +1441,36 @@ format_supported:
 
     glBindTexture(target, 0);
 
+    // On the Pi 4, hand flutter a one-time RGBA copy of SAND128 frames (see sand128_copy_frame).
+    // If the copy fails, flutter samples the image texture directly, as for every other format.
+    GLuint image_texture = 0;
+#ifdef DRM_FORMAT_MOD_BROADCOM_SAND128
+    if (is_sand128 && target == GL_TEXTURE_EXTERNAL_OES && sand128_copy_setup(interface)) {
+        // The copy's longer side is at most the display's longer side (independent of the rotation):
+        // more resolution than that never reaches the screen, and on the Pi 4 a 4K RGBA copy alone takes
+        // ~19 ms of GPU per frame, so on a 1080p display 4K frames are copied at 1080p.
+        int copy_width = width, copy_height = height;
+        int max_side = interface->sand_copy_max_side;
+        if (max_side > 0 && MAX(width, height) > max_side) {
+            double scale = (double) max_side / MAX(width, height);
+            copy_width = MAX(1, (int) (width * scale + 0.5));
+            copy_height = MAX(1, (int) (height * scale + 0.5));
+        }
+
+        GLuint copy = sand128_copy_frame(interface, texture, copy_width, copy_height);
+        if (copy != 0) {
+            image_texture = texture;
+            texture = copy;
+            target = GL_TEXTURE_2D;
+        }
+    }
+#endif
+
     egl_ok = eglMakeCurrent(interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (egl_ok == EGL_FALSE) {
         egl_error = eglGetError();
         LOG_ERROR("Could not clear EGL context. eglMakeCurrent: %" PRId32 "\n", egl_error);
+        if (image_texture != 0) glDeleteTextures(1, &image_texture);
         goto fail_delete_texture;
     }
 
@@ -1238,6 +1485,7 @@ format_supported:
     frame->dmabuf_fds[2] = planes[2].fd;
     frame->dmabuf_fds[3] = planes[3].fd;
     frame->image = egl_image;
+    frame->image_texture = image_texture;
     frame->gl_frame.target = target;
     frame->gl_frame.name = texture;
     frame->gl_frame.format = GL_RGBA8_OES;
@@ -1276,6 +1524,9 @@ void frame_destroy(struct video_frame *frame) {
     ASSERT_EGL_TRUE(egl_ok);
     (void) egl_ok;
     glDeleteTextures(1, &frame->gl_frame.name);
+    if (frame->image_texture != 0) {
+        glDeleteTextures(1, &frame->image_texture);
+    }
     assert(GL_NO_ERROR == glGetError());
     egl_ok = eglMakeCurrent(frame->interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     ASSERT_EGL_TRUE(egl_ok);
